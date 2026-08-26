@@ -1,0 +1,552 @@
+可以把 file_read 的完整链路和耗时公式一一对齐。先看总图：
+Claude Code
+  │
+  │ ① MCP 请求
+  ▼
+FastMCP
+  │
+  │ ② JSON 解析和参数校验
+  ▼
+file_read()
+  │
+  │ ③ 查找 Sandbox 对象
+  ▼
+sandbox.files.read_file()
+  │
+  │ ④ SDK 构造 HTTP 请求
+  ▼
+httpx.AsyncClient
+  │
+  │ ⑤ HTTP 网络传输
+  ▼
+execd /files/download
+  │
+  │ ⑥ Gin 路由和参数处理
+  ▼
+os.Open + 文件读取
+  │
+  │ ⑦ 文件系统操作
+  ▼
+HTTP raw bytes
+  │
+  │ ⑧ HTTP 响应传输
+  ▼
+Python bytes
+  │
+  │ ⑨ decode + MCP 序列化
+  ▼
+Claude Code
+对应公式：
+T_total =
+T_mcp_transport
++ T_mcp_parse
++ T_registry_lookup
++ T_sdk_prepare
++ T_http_request
++ T_execd_route
++ T_filesystem
++ T_http_response
++ T_bytes_decode
++ T_mcp_serialize
++ T_mcp_return
+之前的 T_http_wait 和 T_response 范围有些宽。为了方便实际埋点，这里把它们拆得更精确。
+1. T_mcp_transport
+对应过程：
+Claude Code
+  ↓ stdio / streamable-http
+opensandbox-mcp
+Claude Code 先生成 Tool Call：
+{
+  "name": "file_read",
+  "arguments": {
+    "sandbox_id": "sandbox-123",
+    "path": "/workspace/main.py"
+  }
+}
+然后 FastMCP 客户端把它包装成 MCP 请求，大致类似：
+{
+  "jsonrpc": "2.0",
+  "id": 123,
+  "method": "tools/call",
+  "params": {
+    "name": "file_read",
+    "arguments": {
+      "sandbox_id": "sandbox-123",
+      "path": "/workspace/main.py"
+    }
+  }
+}
+T_mcp_transport 测量：
+Claude Code 开始发送 MCP 请求
+        ↓
+opensandbox-mcp 完整收到请求
+它包含：
+- MCP JSON 编码
+- stdio 管道写入，或者 HTTP 发送
+- 进程调度
+- 数据复制
+- streamable-http 模式下的 TCP/HTTP 开销
+不同模式：
+stdio：
+Claude Code → 子进程 stdin
+
+streamable-http：
+Claude Code → TCP → HTTP → MCP Server
+对于 file_read，请求通常很小，所以这部分主要是固定开销。
+2. T_mcp_parse
+对应：
+FastMCP 收到 MCP JSON
+  ↓
+JSON 反序列化
+  ↓
+找到 file_read Tool
+  ↓
+校验 sandbox_id/path/encoding/range_header
+  ↓
+调用 Python file_read()
+FastMCP 需要做：
+1. 解析 JSON-RPC。
+2. 检查 method == tools/call。
+3. 根据 Tool 名查注册表。
+4. 找到 file_read()。
+5. 根据函数签名和类型注解校验参数。
+6. 将 JSON 参数转换成 Python 对象。
+注册位置：
+[server.py (line 89)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:89)
+对应代码：
+@tool()
+async def file_read(
+    sandbox_id: str,
+    path: str,
+    *,
+    encoding: str = "utf-8",
+    range_header: str | None = None,
+    connect_if_missing: bool = False,
+):
+代码位置：
+[server.py (line 481)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:481)
+T_mcp_parse 的边界：
+FastMCP 收到完整消息
+        ↓
+正式进入 file_read() 函数
+通常这部分不大，但高并发时可能受以下因素影响：
+- Python event loop 调度
+- JSON 大小
+- 参数模型校验
+- 同时执行的 MCP Tool 数量
+注意，读取请求本身很小，因此请求解析通常不是大头；返回文件内容时的 JSON 编码更值得关注。
+3. T_registry_lookup
+进入 file_read() 后，第一步是：
+sandbox = await _get_or_connect_sandbox(
+    sandbox_id,
+    connect_if_missing=connect_if_missing,
+)
+代码位置：
+[server.py (line 503)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:503)
+内部：
+sandbox = await state.get(sandbox_id)
+
+if sandbox is not None:
+    return sandbox
+代码位置：
+[server.py (line 109)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:109)
+热路径实际做的是：
+获取异步锁
+  ↓
+根据 sandbox_id 查 Python 字典
+  ↓
+返回已存在的 Sandbox 对象
+所以热路径：
+T_registry_lookup ≈ lock + dict lookup
+通常非常小。
+但存在两种情况。
+热路径
+Sandbox 已经注册
+connect_if_missing=False
+只查本地内存。
+冷路径
+Sandbox 没注册
+connect_if_missing=True
+会执行：
+Sandbox.connect(...)
+这时该阶段实际变成：
+本地查找
+  ↓
+没有找到
+  ↓
+调用 OpenSandbox Server
+  ↓
+查询 Sandbox
+  ↓
+获取 execd endpoint
+  ↓
+创建 FilesystemAdapter
+  ↓
+创建 httpx.AsyncClient
+  ↓
+保存 Sandbox 对象
+此时它已经不能简单称为 T_registry_lookup，应拆为：
+T_registry_lookup
++ T_sandbox_connect
++ T_endpoint_discovery
++ T_adapter_init
+做性能测试时必须区分：
+Warm file_read：Sandbox 已注册
+Cold file_read：需要 Sandbox.connect
+不能混合统计。
+4. T_sdk_prepare
+找到 Sandbox 后执行：
+content = await sandbox.files.read_file(
+    path,
+    encoding=encoding,
+    range_header=range_header,
+)
+这一调用本身只是 Python 进程内的方法调用：
+file_read()
+  ↓
+FilesystemAdapter.read_file()
+然后：
+content = await self.read_bytes(...)
+代码位置：
+[filesystem_adapter.py (line 148)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:148)
+read_bytes() 构造请求：
+request_data = self._build_download_request(
+    path,
+    range_header,
+    offset=offset,
+    limit=limit,
+)
+里面构造：
+url = self._get_execd_url(
+    self.FILESYSTEM_DOWNLOAD_PATH
+)
+
+headers = {}
+params = {"path": path}
+
+if range_header:
+    headers["Range"] = range_header
+代码位置：
+[filesystem_adapter.py (line 659)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:659)
+T_sdk_prepare 包含：
+- 进入 FilesystemAdapter.read_file()
+- 进入 read_bytes()
+- 创建 Python 字典
+- 拼接 execd URL
+- 创建 query 参数
+- 创建 Range header
+- 从 adapter 获取已存在的 httpx.AsyncClient
+- httpx 构造 HTTP Request
+- 对 query 参数进行 URL 编码
+例如将：
+{
+    "path": "/workspace/main.py"
+}
+转换成：
+GET /files/download?path=%2Fworkspace%2Fmain.py
+这部分没有读取文件，也没有调用 OpenSandbox Server。
+正常情况下也不会创建新的 httpx.AsyncClient，因为 adapter 初始化时已经创建并保存：
+self._httpx_client = httpx.AsyncClient(...)
+代码位置：
+[filesystem_adapter.py (line 117)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:117)
+5. T_http_request
+SDK 执行：
+response = await client.get(
+    request_data["url"],
+    headers=request_data["headers"],
+    params=request_data["params"],
+)
+代码位置：
+[filesystem_adapter.py (line 191)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:191)
+这一阶段是：
+Python SDK
+  ↓
+HTTP 请求
+  ↓
+execd
+它包含：
+- 从 httpx 连接池获取连接
+- 如果没有可复用连接，建立 TCP 连接
+- HTTP 请求头编码
+- 发送请求行和 Header
+- 网络传输
+- execd 接收完整请求
+如果启用了直连：
+MCP Server → execd
+如果启用 use_server_proxy：
+MCP Server
+  ↓
+OpenSandbox Server Proxy
+  ↓
+execd
+Proxy 模式会多出：
+- MCP Server 到 OpenSandbox Server 的 RTT
+- Server 路由处理
+- Server 到 execd 的 RTT
+- 请求和响应转发
+因此这里建议进一步写成：
+T_http_request =
+T_connection_pool_wait
++ T_connection_establish
++ T_request_encode
++ T_network_to_execd
+连接已经复用时：
+T_connection_establish ≈ 0
+高并发时需要特别关注：
+T_connection_pool_wait
+因为连接池可能没有空闲连接。
+6. T_execd_route
+execd 收到：
+GET /files/download?path=/workspace/main.py
+Gin Router 匹配：
+files.GET(
+    "/download",
+    withFilesystem(func(c *FilesystemController) {
+        c.DownloadFile()
+    }),
+)
+代码位置：
+[router.go (line 36)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/router.go:36)
+然后执行：
+func (c *FilesystemController) DownloadFile()
+这一阶段包含：
+- Go HTTP Server 接收请求
+- Gin 中间件
+- 路由匹配
+- 创建 FilesystemController
+- 指标记录初始化
+- 读取 query 参数
+- 路径展开
+- 读取 Range header
+- 参数合法性检查
+具体代码：
+filePath := c.ctx.Query("path")
+
+resolvedFilePath, err :=
+    pathutil.ExpandPath(filePath)
+
+rawOffset := c.ctx.Query("offset")
+rawLimit := c.ctx.Query("limit")
+rangeHeader := c.ctx.GetHeader("Range")
+代码位置：
+[filesystem_download.go (line 34)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem_download.go:34)
+因此：
+T_execd_route
+的边界可以定义为：
+execd 收到 HTTP 请求
+        ↓
+执行 os.Open() 之前
+7. T_open
+execd 开始真正访问文件系统：
+file, err := os.Open(resolvedFilePath)
+代码位置：
+[filesystem_download.go (line 71)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem_download.go:71)
+T_open 包括：
+- 路径解析
+- 文件系统目录项查找
+- 权限检查
+- 创建文件描述符
+- 内核返回 *os.File
+注意：
+os.Open()
+通常只是打开文件，并不代表文件内容已经全部读取。
+这部分可能受以下因素影响：
+- 路径深度
+- 文件系统类型
+- overlay filesystem
+- 网络盘/NFS
+- 页缓存
+- 并发文件描述符压力
+8. T_disk_read
+打开文件后，普通完整读取最终调用：
+http.ServeContent(
+    c.ctx.Writer,
+    c.ctx.Request,
+    filepath.Base(resolvedFilePath),
+    fileInfo.ModTime(),
+    file,
+)
+代码位置：
+[filesystem_download.go (line 120)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem_download.go:120)
+Range 模式调用：
+file.Seek(r.start, io.SeekStart)
+io.CopyN(c.ctx.Writer, file, r.length)
+代码位置：
+[filesystem_download.go (line 98)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem_download.go:98)
+这部分完成：
+文件系统
+  ↓
+内核 page cache / 磁盘
+  ↓
+Go 文件对象
+  ↓
+HTTP Response Writer
+T_disk_read 这个名字不一定完全准确，因为数据可能来自：
+内存 page cache
+而不是物理磁盘。
+更准确可以称：
+T_fs_read
+它主要受：
+- 文件大小
+- 文件是否在 page cache
+- 底层存储
+- Range 大小
+- overlayfs
+- 网络文件系统
+- 同时读取的文件数
+影响。
+一个重要问题
+T_fs_read 和 T_http_response 在实现中可能发生重叠。
+因为：
+io.CopyN(HTTP Writer, file, length)
+是一边读文件一边向网络发送，并不是：
+先完整读完
+然后完整发送
+因此严格测量时，它们不能总是简单相加。
+更精确写法是：
+T_stream =
+T_first_byte
++ max(T_fs_read, T_network_transfer)
+但第一阶段为了容易理解，可以仍然拆开估算。
+9. T_http_response
+execd 将文件作为原始字节返回：
+HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+Content-Length: ...
+
+<raw file bytes>
+这一阶段是：
+execd HTTP Writer
+  ↓
+网络
+  ↓
+httpx
+  ↓
+response.content
+包含：
+- HTTP response header 生成
+- 文件字节写入 socket
+- 网络传输
+- Python httpx 接收
+- httpx 汇总完整 response body
+- 生成 Python bytes
+SDK 当前使用：
+return response.content
+因此 file_read 默认会等待完整 response body 到达，然后把全部数据放入内存。
+也就是说：
+execd 支持流式返回
+        ↓
+但 MCP file_read 使用 read_bytes()
+        ↓
+httpx 汇总成完整 bytes
+SDK 虽然另有：
+read_bytes_stream()
+但 MCP file_read 当前没有使用流式读取。
+大文件下，这里可能成为明显瓶颈。
+10. T_bytes_decode
+HTTP 内容返回 Python 后：
+content = await self.read_bytes(...)
+return content.decode(encoding)
+也就是：
+Python bytes
+  ↓ UTF-8 decode
+Python str
+代码位置：
+[filesystem_adapter.py (line 148)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:148)
+例如：
+b"hello\nworld"
+变成：
+"hello\nworld"
+T_bytes_decode 主要受：
+- 文件大小
+- 字符编码
+- CPU
+- 是否存在非法编码字符
+影响。
+这通常是一次完整数据扫描：
+时间复杂度约 O(file_size)
+并且内存中会短暂同时存在：
+bytes 文件内容
++
+str 文件内容
+大文件下会增加峰值内存。
+11. T_mcp_serialize
+SDK 返回字符串后，MCP Tool 创建：
+FileReadResponse(
+    path=path,
+    content=content,
+)
+代码位置：
+[server.py (line 507)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:507)
+FastMCP 再把它转换成 MCP Tool Result。
+概念上类似：
+{
+  "path": "/workspace/main.py",
+  "content": "print(\"hello\")\n..."
+}
+这一步包含：
+- Pydantic 模型转换
+- Python str 转 JSON 字符串
+- 对特殊字符做 JSON 转义
+- 构造 MCP JSON-RPC response
+例如原文件：
+print("hello")
+在 JSON 中可能表示成：
+"print(\"hello\")\n"
+文件中如果有很多：
+"
+\
+换行符
+JSON 编码后的结果会变大。
+T_mcp_serialize 同样大致是：
+O(file_size)
+所以一个文件在 Python/MCP 端至少可能经历：
+HTTP bytes
+  ↓ 一次完整处理
+UTF-8 decode
+  ↓ 又一次完整处理
+JSON encode
+12. T_mcp_return
+最后 MCP 响应通过 transport 返回 Claude Code：
+FastMCP
+  ↓ stdio / streamable-http
+Claude Code
+这部分包含：
+- 把 MCP JSON 写入 stdout，或者 HTTP response
+- 管道/网络传输
+- Claude Code 接收完整 MCP 消息
+- Claude Code 解析 JSON
+- 将 Tool Result 加入 Agent 上下文
+如果是大文件，这一阶段不仅有传输时间，还有：
+Tool Result 进入模型上下文
+后续甚至还会发生：
+文本 → tokenizer → tokens → 模型输入
+严格来说，Tokenization 和下一次 LLM 推理不属于 file_read Tool Server 的执行时间，但属于 Agent 端到端观察延迟。
+因此可以分为：
+Tool E2E latency：
+发出 Tool Call → Claude Code 收到 Tool Result
+
+Agent observation latency：
+发出 Tool Call → 模型能够基于结果继续推理
+后者还要加：
+T_context_build
++ T_tokenize
++ T_next_llm_request
+十三、与代码链路完整对照
+代码/执行位置	对应耗时
+Claude Code 生成并发送 tools/call	T_mcp_transport
+FastMCP 解析 JSON、匹配 Tool、校验参数	T_mcp_parse
+_get_or_connect_sandbox()	T_registry_lookup
+Sandbox.connect()，仅冷路径	T_sandbox_connect
+sandbox.files.read_file()	Python 函数调用，计入 T_sdk_prepare
+_build_download_request()	T_sdk_prepare
+httpx.AsyncClient.get() 发送请求	T_http_request
+Gin 匹配 /files/download	T_execd_route
+Query()、ExpandPath()、Range 校验	T_execd_route
+os.Open()	T_open
+http.ServeContent() / io.CopyN()	T_fs_read + T_http_response
+response.content	T_http_response
+content.decode()	T_bytes_decode
+FileReadResponse(...)	少量模型构造时间
+FastMCP JSON 编码	T_mcp_serialize
+MCP 响应返回 Claude Code	T_mcp_return
