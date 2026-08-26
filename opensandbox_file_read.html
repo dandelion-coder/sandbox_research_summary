@@ -1,55 +1,63 @@
 可以把 file_read 的完整链路和耗时公式一一对齐。先看总图：
 Claude Code
   │
-  │ ① MCP 请求
+  │ ① T_mcp_request
   ▼
-FastMCP
+FastMCP 收到 MCP 请求
   │
-  │ ② JSON 解析和参数校验
+  │ ② T_mcp_parse
   ▼
 file_read()
   │
-  │ ③ 查找 Sandbox 对象
+  │ ③ T_registry_lookup
   ▼
-sandbox.files.read_file()
+获得 Sandbox 对象
   │
-  │ ④ SDK 构造 HTTP 请求
+  │ ④ T_sdk_prepare
   ▼
 httpx.AsyncClient
   │
-  │ ⑤ HTTP 网络传输
+  │ ⑤ T_http_request
   ▼
-execd /files/download
+execd 收到请求
   │
-  │ ⑥ Gin 路由和参数处理
+  │ ⑥ T_execd_route
   ▼
-os.Open + 文件读取
+DownloadFile 准备打开文件
   │
-  │ ⑦ 文件系统操作
+  │ ⑦ T_open
   ▼
-HTTP raw bytes
+得到 *os.File
   │
-  │ ⑧ HTTP 响应传输
+  │ ⑧ T_fs_read_and_http_response
   ▼
-Python bytes
+Python response.content
   │
-  │ ⑨ decode + MCP 序列化
+  │ ⑨ T_bytes_decode
   ▼
-Claude Code
-对应公式：
-T_total =
-T_mcp_transport
+Python str
+  │
+  │ ⑩ T_mcp_serialize
+  ▼
+MCP JSON Response
+  │
+  │ ⑪ T_mcp_return
+  ▼
+Claude Code 收到 Tool Result
+统一公式：
+T_file_read =
+T_mcp_request
 + T_mcp_parse
 + T_registry_lookup
 + T_sdk_prepare
 + T_http_request
 + T_execd_route
-+ T_filesystem
-+ T_http_response
++ T_open
++ T_fs_read_and_http_response
 + T_bytes_decode
 + T_mcp_serialize
 + T_mcp_return
-之前的 T_http_wait 和 T_response 范围有些宽。为了方便实际埋点，这里把它们拆得更精确。
+
 1. T_mcp_transport
 对应过程：
 Claude Code
