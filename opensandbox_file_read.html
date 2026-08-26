@@ -558,3 +558,446 @@ content.decode()	T_bytes_decode
 FileReadResponse(...)	少量模型构造时间
 FastMCP JSON 编码	T_mcp_serialize
 MCP 响应返回 Claude Code	T_mcp_return
+
+
+  用通俗易懂的话，把这11个过程目的是什么，输入输出是什么，干了啥说明白，我要汇总一下
+
+
+
+
+
+
+
+15:02
+
+
+
+
+
+
+可以把 file_read 理解成一次“Claude Code 委托 OpenSandbox 帮它取文件”的过程：
+Claude Code 提出读文件请求
+        ↓
+MCP Server 接单
+        ↓
+找到文件属于哪个 Sandbox
+        ↓
+Python SDK 组织 HTTP 请求
+        ↓
+execd 在 Sandbox 中打开并读取文件
+        ↓
+文件内容原路返回
+        ↓
+转换成 Claude Code 能理解的 MCP 结果
+下面是统一后的 11 个过程。
+OpenSandbox file_read 的11个过程
+步骤	过程	通俗理解	输入	输出
+1	MCP 请求传输	Claude Code 把“读哪个文件”的订单发出去	Tool 名、Sandbox ID、文件路径	MCP Server 收到的 MCP 消息
+2	MCP 请求解析	MCP Server 拆开订单，确认要调用 file_read	MCP JSON 消息	Python 参数
+3	Sandbox 查询	根据 Sandbox ID 找到文件所在的工作环境	sandbox_id	Sandbox 对象
+4	SDK 请求准备	把“读文件”转换成 execd 的 HTTP 请求	Sandbox 对象、文件路径	HTTP URL、参数和 Header
+5	HTTP 请求发送	把文件读取请求送到 Sandbox 内的 execd	HTTP Request	execd 收到的请求
+6	execd 路由处理	execd 判断该请求应该交给文件下载函数	URL、path、Range 等参数	解析后的真实文件路径
+7	打开文件	操作系统找到文件并返回文件句柄	真实文件路径	已打开的文件对象
+8	读取并返回文件	从文件系统读取字节，并通过 HTTP 发回 Python SDK	文件对象	Python bytes
+9	文件内容解码	把原始字节转换成文本字符串	Python bytes	Python str
+10	MCP 结果序列化	把文件字符串包装成 MCP JSON	文件路径、Python字符串	MCP JSON Response
+11	MCP 结果返回	把结果发送回 Claude Code	MCP JSON Response	Claude Code 的 Tool Result
+
+
+第1步：MCP请求传输
+目的
+把 Claude Code 的“读文件意图”发送给 OpenSandbox MCP Server。
+可以理解为：
+Claude Code 填写了一张读文件申请单，然后交给 MCP Server。
+
+输入
+Claude Code 先决定调用：
+mcp__opensandbox-sandbox__file_read
+参数：
+{
+  "sandbox_id": "sandbox-123",
+  "path": "/workspace/main.py"
+}
+然后 MCP 会包装成类似：
+{
+  "method": "tools/call",
+  "params": {
+    "name": "file_read",
+    "arguments": {
+      "sandbox_id": "sandbox-123",
+      "path": "/workspace/main.py"
+    }
+  }
+}
+干了什么
+根据 transport，有两种发送方式：
+stdio：
+Claude Code → MCP子进程的标准输入
+
+streamable-http：
+Claude Code → HTTP → MCP Server
+这一阶段只负责“发送请求”，还没有读取文件。
+输出
+OpenSandbox MCP Server 收到一段完整的 MCP JSON 消息。
+输入：Claude Code的Tool Call
+输出：MCP Server收到的JSON请求
+第2步：MCP请求解析
+目的
+弄清楚 Claude Code 惽调用哪个 Tool，以及参数是什么。
+可以理解为：
+MCP Server 打开申请单，检查这是 file_read 申请，并读出文件路径。
+
+输入
+MCP JSON：
+{
+  "name": "file_read",
+  "arguments": {
+    "sandbox_id": "sandbox-123",
+    "path": "/workspace/main.py"
+  }
+}
+干了什么
+FastMCP 会：
+1. 解析 JSON。
+2. 找到名为 file_read 的 Tool。
+3. 检查必填参数。
+4. 检查参数类型。
+5. 转换成 Python 参数。
+6. 调用 file_read()。
+例如：
+JSON中的：
+
+"sandbox_id": "sandbox-123"
+
+转换成：
+
+Python变量 sandbox_id
+输出
+进入 Python 函数：
+file_read(
+    sandbox_id="sandbox-123",
+    path="/workspace/main.py",
+)
+输入：MCP JSON
+输出：Python函数参数
+第3步：Sandbox查询
+目的
+确定要从哪个 Sandbox 读取文件。
+因为 OpenSandbox 可能同时管理很多 Sandbox：
+sandbox-123
+sandbox-456
+sandbox-789
+可以理解为：
+根据“房间号”找到文件所在的具体工作间。
+
+输入
+sandbox_id = "sandbox-123"
+干了什么
+MCP Server 在本地状态中查询：
+ServerState
+  ├── sandbox-123 → Sandbox对象A
+  ├── sandbox-456 → Sandbox对象B
+  └── sandbox-789 → Sandbox对象C
+如果找到，直接返回。
+如果没有找到：
+- connect_if_missing=False：报错。
+- connect_if_missing=True：调用 Sandbox.connect() 连接现有 Sandbox。
+输出
+一个 Python Sandbox 对象：
+sandbox
+这个对象中已经包含：
+- Sandbox ID
+- execd 地址
+- FilesystemAdapter
+- HTTP Client
+- 连接配置
+输入：sandbox_id
+输出：能够操作该Sandbox的Python对象
+第4步：SDK请求准备
+目的
+把“读取文件”转换成 execd 能理解的 HTTP 请求。
+可以理解为：
+MCP Server 已经找到工作间，现在 SDK 要写一张给工作间内部文件服务看的请求单。
+
+输入
+Sandbox对象
+文件路径：/workspace/main.py
+编码：utf-8
+可选Range：bytes=0-1023
+MCP Tool 调用：
+sandbox.files.read_file(
+    path,
+    encoding=encoding,
+    range_header=range_header,
+)
+干了什么
+SDK 进入：
+FilesystemAdapter.read_file()
+  ↓
+FilesystemAdapter.read_bytes()
+  ↓
+_build_download_request()
+然后构造：
+GET /files/download?path=/workspace/main.py
+如果只读一部分：
+GET /files/download?path=/workspace/main.py
+Range: bytes=0-1023
+SDK 还会找到之前创建好的：
+httpx.AsyncClient
+输出
+一个准备好的 HTTP Request：
+URL:
+http://<execd-address>/files/download
+
+Query:
+path=/workspace/main.py
+
+Header:
+Range: bytes=0-1023
+输入：Python形式的文件读取参数
+输出：HTTP URL、Query、Header
+第5步：HTTP请求发送
+目的
+把 SDK 构造好的请求发送到 Sandbox 内的 execd。
+可以理解为：
+把文件读取申请从 MCP Server 送到 Sandbox 内部的文件服务。
+
+输入
+GET /files/download?path=/workspace/main.py
+干了什么
+Python SDK 调用：
+await client.get(...)
+HTTP Client 会：
+1. 从连接池中取得连接。
+2. 如果可以，复用已有连接。
+3. 编码 HTTP 请求。
+4. 将请求发送给 execd。
+5. 等待 execd 返回结果。
+默认直连：
+Python SDK → execd
+代理模式：
+Python SDK
+  ↓
+OpenSandbox Server Proxy
+  ↓
+execd
+输出
+execd 收到完整 HTTP 请求：
+GET /files/download
+path=/workspace/main.py
+输入：HTTP Request
+输出：execd收到的HTTP Request
+第6步：execd路由处理
+目的
+让 execd 判断这个请求应该交给哪个处理函数，并解析文件路径等参数。
+可以理解为：
+execd 前台收到申请，确认这是“文件下载业务”，然后把它交给文件部门。
+
+输入
+GET /files/download?path=/workspace/main.py
+干了什么
+Gin Router 看到：
+GET /files/download
+将请求交给：
+FilesystemController.DownloadFile()
+然后读取：
+path
+offset
+limit
+Range
+并把：
+/workspace/main.py
+处理成实际文件路径。
+同时检查：
+- path 是否为空
+- Range 是否合法
+- Range 和 offset/limit 是否冲突
+输出
+一个已经检查、展开过的真实文件路径：
+/workspace/main.py
+以及读取方式：
+完整读取
+或
+Range读取
+或
+按行读取
+输入：HTTP路径和请求参数
+输出：真实文件路径和读取方式
+第7步：打开文件
+目的
+让操作系统找到这个文件，并创建一个可读取的文件对象。
+可以理解为：
+已经找到文件柜，现在把具体文件打开。
+
+输入
+真实路径：
+/workspace/main.py
+干了什么
+execd 调用：
+file, err := os.Open(resolvedFilePath)
+操作系统会：
+1. 查找路径。
+2. 检查文件是否存在。
+3. 检查权限。
+4. 打开文件。
+5. 分配文件描述符。
+6. 返回文件对象。
+注意，这一步只是“打开文件”，不代表已经把文件内容全部读取出来。
+输出
+Go 文件对象：
+*os.File
+它可以理解成：
+后续读取这个文件内容的把手。
+
+输入：真实文件路径
+输出：已打开的文件对象
+第8步：读取并返回文件
+目的
+真正读取文件内容，并通过 HTTP 返回 Python SDK。
+可以理解为：
+从打开的文件里取出内容，然后沿着网络送回去。
+
+输入
+*os.File
+以及读取方式：
+完整文件
+Range范围
+按行范围
+干了什么
+完整读取使用：
+http.ServeContent(...)
+Range读取使用：
+file.Seek(...)
+io.CopyN(...)
+文件数据经过：
+Sandbox文件系统
+  ↓
+Linux内核/page cache
+  ↓
+Go文件对象
+  ↓
+HTTP Response Writer
+  ↓
+网络
+  ↓
+Python httpx
+这是一个边读边发送的过程：
+读取一部分 → 发送一部分
+读取一部分 → 发送一部分
+输出
+Python SDK 获得：
+response.content
+类型是：
+bytes
+例如：
+b'print("hello")\n'
+输入：打开的文件对象
+输出：Python bytes
+第9步：文件内容解码
+目的
+把计算机使用的原始字节转换成 Python 文本字符串。
+可以理解为：
+把“文件的二进制内容”翻译成人和模型可以阅读的文字。
+
+输入
+b'print("hello")\n'
+干了什么
+SDK 调用：
+content.decode("utf-8")
+转换过程：
+bytes
+  ↓ UTF-8解码
+str
+输出
+'print("hello")\n'
+这一阶段会扫描整个文件内容。
+大文件下，内存中可能短暂同时存在：
+原始bytes
++
+解码后的str
+输入：Python bytes
+输出：Python str
+第10步：MCP结果序列化
+目的
+把 Python 文件字符串转换成 MCP 协议规定的 JSON 结果。
+可以理解为：
+文件已经取到了，现在重新填写一张 Claude Code 能看懂的结果单。
+
+输入
+文件路径：
+"/workspace/main.py"
+文件字符串：
+'print("hello")\n'
+MCP Tool 先返回：
+FileReadResponse(
+    path=path,
+    content=content,
+)
+干了什么
+FastMCP 会：
+1. 处理 FileReadResponse。
+2. 转换成普通数据结构。
+3. 编码为 JSON。
+4. 对特殊字符进行转义。
+5. 包装成 MCP Tool Result。
+例如：
+{
+  "path": "/workspace/main.py",
+  "content": "print(\"hello\")\n"
+}
+输出
+完整的 MCP JSON Response。
+输入：Python str和文件路径
+输出：MCP JSON响应
+第11步：MCP结果返回
+目的
+把文件内容送回 Claude Code，让模型继续分析。
+可以理解为：
+MCP Server 把处理完的结果单交还给 Claude Code。
+
+输入
+MCP JSON Response：
+{
+  "path": "/workspace/main.py",
+  "content": "print(\"hello\")\n"
+}
+干了什么
+根据 transport：
+stdio：
+FastMCP → stdout → Claude Code
+
+streamable-http：
+FastMCP → HTTP Response → Claude Code
+Claude Code 收到后：
+1. 读取完整 MCP 响应。
+2. 解析 JSON。
+3. 提取文件内容。
+4. 将 Tool Result 加入当前上下文。
+5. 交给模型继续推理。
+输出
+Claude Code 中的 Tool Result：
+文件：/workspace/main.py
+
+内容：
+print("hello")
+输入：MCP JSON响应
+输出：Claude Code可以使用的文件内容
+最简版汇总
+如果需要放到汇报中，可以直接使用这张表：
+步骤	目的	输入	主要操作	输出
+1. MCP请求传输	把读文件请求发给MCP Server	Tool名、Sandbox ID、路径	stdio或HTTP传输	MCP请求
+2. MCP请求解析	找到要执行的Tool	MCP JSON	解析、校验、匹配file_read	Python参数
+3. Sandbox查询	找到目标执行环境	sandbox_id	查询本地Sandbox注册表	Sandbox对象
+4. SDK请求准备	生成execd请求	Sandbox对象、路径	构造URL、Query、Header	HTTP Request
+5. HTTP请求发送	把请求送到execd	HTTP Request	连接池、HTTP传输	execd收到请求
+6. execd路由处理	找到文件处理函数	URL、Query、Header	Gin路由、参数检查、路径展开	真实路径和读取方式
+7. 打开文件	获得文件访问对象	真实文件路径	os.Open()	*os.File
+8. 读取并返回	取出文件内容并发回SDK	文件对象	ServeContent/io.CopyN	Python bytes
+9. 内容解码	把字节转换成文本	bytes	UTF-8 decode	Python str
+10. MCP结果序列化	生成标准MCP结果	路径、Python str	Pydantic转换、JSON编码	MCP JSON
+11. MCP结果返回	把结果交回Claude Code	MCP JSON	stdio或HTTP返回、JSON解析	Tool Result
+
+
+一句话概括：
+Claude Code 通过 MCP 发出读文件请求，OpenSandbox MCP Server 找到目标 Sandbox，Python SDK 将请求转换为 HTTP 调用，execd 直接打开并读取 Sandbox 中的文件，随后文件字节被转换成文本和 MCP JSON，最终返回 Claude Code。
