@@ -1,0 +1,776 @@
+我沿着本地源码把 OpenSandbox 当前 MCP 暴露的文件 Tool 全部追了一遍。核心结论是：
+OpenSandbox 文件 Tool 不会启动 Shell，也不会执行 cat、cp、rm。它们通过 MCP 调用 Python SDK，再由 SDK 使用 HTTP 调用 Sandbox 内的 execd，execd 最后直接调用 Go/操作系统文件函数。
+
+主链路是：
+Claude Code
+  ↓ MCP JSON
+opensandbox-mcp / FastMCP
+  ↓ Python 函数
+file_xxx()
+  ↓ Python SDK
+sandbox.files.xxx()
+  ↓ 复用 httpx.AsyncClient
+execd HTTP API
+  ↓ Go Controller
+os.Open / os.WriteFile / os.RemoveAll / filepath.Walk ...
+  ↓
+Sandbox Filesystem
+  ↓
+结果返回 Claude Code
+一、OpenSandbox MCP 当前有哪些文件 Tool？
+从 [server.py (line 481)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:481) 可以确认，目前 MCP 层注册了这些文件 Tool：
+MCP Tool	功能
+file_read	读取文本文件
+file_write	写入文本文件
+file_delete	删除一个或多个文件
+file_search	按 Glob 模式搜索文件名
+file_create_directories	批量创建目录
+file_delete_directories	批量删除目录
+file_move	批量移动或重命名文件/目录
+file_replace_contents	批量替换文件中的文本
+
+
+需要特别注意：
+- file_search 是“搜索文件名”，不是类似 Grep 的“搜索文件内容”。
+- Python SDK 还支持 list_directory、get_file_info、set_permissions 等能力。
+- 但当前这份 opensandbox-mcp/server.py 没有把它们全部注册成 MCP Tool。
+也就是说：
+execd 能力 > Python SDK 暴露能力 > 当前 MCP 暴露能力
+二、公共调用前半段
+所有文件 Tool 的前半段基本相同。
+1. Claude Code 调用 MCP Tool
+Claude Code 看到的工具名通常类似：
+mcp__opensandbox-sandbox__file_read
+mcp__opensandbox-sandbox__file_write
+mcp__opensandbox-sandbox__file_search
+模型生成：
+{
+  "sandbox_id": "sandbox-123",
+  "path": "/workspace/main.py"
+}
+然后通过 MCP transport 发送到 opensandbox-mcp：
+Claude Code
+  ↓ stdio 或 streamable-http
+FastMCP
+2. FastMCP 找到 Python 函数
+每个 Tool 都使用：
+@tool()
+async def file_read(...):
+    ...
+tool() 内部最终调用：
+mcp.tool()(func)
+注册代码：
+[server.py (line 89)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:89)
+3. 根据 sandbox_id 找 Sandbox 对象
+每个文件 Tool 都先调用：
+sandbox = await _get_or_connect_sandbox(
+    sandbox_id,
+    connect_if_missing=connect_if_missing,
+)
+OpenSandbox MCP Server 内部维护：
+ServerState
+  ├── sandbox-123 → Sandbox 对象
+  └── sandbox-456 → Sandbox 对象
+如果已经存在：
+sandbox = await state.get(sandbox_id)
+
+if sandbox is not None:
+    return sandbox
+代码位置：
+[server.py (line 109)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:109)
+所以正常热路径不是：
+每个 Tool → 重新连接 Sandbox
+而是：
+sandbox_create/connect
+        ↓
+Sandbox 对象保存到内存
+        ↓
+多个文件 Tool 复用
+如果 connect_if_missing=False 且 Sandbox 不在本地注册表，就直接报错。
+如果设置：
+connect_if_missing=True
+才会执行额外的：
+Sandbox.connect(...)
+这会引入 OpenSandbox Server 控制面调用，增加明显时延。
+三、file_read 的完整执行过程
+MCP 层
+content = await sandbox.files.read_file(
+    path,
+    encoding=encoding,
+    range_header=range_header,
+)
+
+return FileReadResponse(
+    path=path,
+    content=content,
+)
+代码：
+[server.py (line 482)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:482)
+SDK 层
+read_file() 先调用：
+content = await self.read_bytes(...)
+return content.decode(encoding)
+代码：
+[filesystem_adapter.py (line 148)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:148)
+read_bytes() 发送：
+response = await client.get(
+    request_data["url"],
+    headers=request_data["headers"],
+    params=request_data["params"],
+)
+
+return response.content
+请求格式：
+GET /files/download?path=/workspace/main.py
+如果设置范围：
+GET /files/download?path=/workspace/main.py
+Range: bytes=0-1023
+代码：
+[filesystem_adapter.py (line 186)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:186)
+execd 路由
+路由注册：
+files.GET("/download", ...)
+代码：
+[router.go (line 36)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/router.go:36)
+进入：
+func (c *FilesystemController) DownloadFile()
+执行：
+filePath := c.ctx.Query("path")
+resolvedFilePath, err := pathutil.ExpandPath(filePath)
+file, err := os.Open(resolvedFilePath)
+代码：
+[filesystem_download.go (line 34)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem_download.go:34)
+普通完整读取使用：
+http.ServeContent(..., file)
+字节范围读取使用：
+file.Seek(...)
+io.CopyN(...)
+代码：
+[filesystem_download.go (line 98)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem_download.go:98)
+最终链路：
+file_read
+  ↓
+sandbox.files.read_file
+  ↓
+FilesystemAdapter.read_file
+  ↓
+FilesystemAdapter.read_bytes
+  ↓
+GET /files/download
+  ↓
+FilesystemController.DownloadFile
+  ↓
+os.Open
+  ↓
+http.ServeContent / io.CopyN
+  ↓
+HTTP raw bytes
+  ↓
+bytes.decode("utf-8")
+  ↓
+FileReadResponse
+  ↓
+MCP JSON
+  ↓
+Claude Code
+性能特点
+优点：
+- 不启动 Shell
+- 不执行 cat
+- 支持 HTTP Range
+- execd 返回原始字节，不把文件封装成 JSON
+- SDK 复用 HTTP Client
+潜在问题：
+- MCP Tool 暂时没有暴露 SDK 已支持的 offset/limit
+- 完整文件会被全部读回
+- Python 中要执行 bytes → str
+- FastMCP 又要执行 str → MCP JSON
+- 大文件产生内存复制、JSON 转义和大量 Token
+四、file_write 的完整执行过程
+MCP 层
+await sandbox.files.write_file(
+    path,
+    content,
+    encoding=encoding,
+    mode=mode,
+    owner=owner,
+    group=group,
+)
+代码：
+[server.py (line 513)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:513)
+SDK 层
+单文件写入只是一个便利方法：
+entry = WriteEntry(...)
+await self.write_files([entry])
+代码：
+[filesystem_adapter.py (line 414)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:414)
+write_files() 使用：
+POST /files/upload
+Content-Type: multipart/form-data
+一个上传项包含两部分：
+metadata:
+{
+  path,
+  owner,
+  group,
+  mode
+}
+
+file:
+实际文件内容
+SDK 有两种上传方式。
+直连 execd
+使用 chunked transfer：
+await client.post(
+    url,
+    content=_body(),
+    headers={"content-type": "multipart/form-data; boundary=..."},
+)
+这可以避免先把整个 multipart body 拼进内存。
+Server Proxy
+使用带 Content-Length 的 multipart：
+await client.post(url, files=multipart_parts)
+代码：
+[filesystem_adapter.py (line 246)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:246)
+execd 层
+路由：
+POST /files/upload
+进入：
+FilesystemController.UploadFile()
+然后：
+解析 multipart
+  ↓
+读取 metadata JSON
+  ↓
+解析 path/mode/owner/group
+  ↓
+打开目标文件
+  ↓
+写入内容
+  ↓
+设置权限
+关键代码：
+dst, err := os.OpenFile(
+    resolvedPath,
+    os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
+    os.ModePerm,
+)
+代码：
+[filesystem_upload.go (line 166)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem_upload.go:166)
+完整链路：
+file_write
+  ↓
+sandbox.files.write_file
+  ↓
+write_files([entry])
+  ↓
+生成 multipart
+  ↓
+POST /files/upload
+  ↓
+UploadFile
+  ↓
+解析 metadata JSON
+  ↓
+os.OpenFile(O_CREATE | O_TRUNC)
+  ↓
+写入文件
+  ↓
+设置权限
+性能特点
+优点：
+- SDK 底层支持一次上传多个文件
+- 直连模式支持 chunked streaming
+- 多文件可以合并为一个 HTTP RTT
+当前 MCP 的问题：
+SDK：write_files(entries) 支持批量
+MCP：file_write 一次只接收一个 path/content
+因此 Agent 写三个文件时：
+当前：
+3 次 MCP Tool Call
+3 次 HTTP 请求
+
+可以优化为：
+1 次 file_write_many
+1 次 HTTP multipart
+这是非常明确的工具时延优化点。
+五、file_delete 的完整执行过程
+MCP：
+await sandbox.files.delete_files(paths)
+代码：
+[server.py (line 553)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:553)
+SDK：
+await remove_files.asyncio_detailed(
+    client=client,
+    path=paths,
+)
+代码：
+[filesystem_adapter.py (line 459)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:459)
+HTTP：
+DELETE /files?path=/a.py&path=/b.py
+execd：
+paths := c.ctx.QueryArray("path")
+
+for _, filePath := range paths {
+    DeleteFile(filePath)
+}
+代码：
+[filesystem.go (line 91)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem.go:91)
+链路：
+file_delete(paths[])
+  ↓
+delete_files(paths[])
+  ↓
+DELETE /files?path=A&path=B
+  ↓
+RemoveFiles
+  ↓
+循环删除每个文件
+这里已经支持批量：
+多个文件
+  ↓
+一次 MCP Call
+  ↓
+一次 HTTP RTT
+但 execd 内部仍然顺序循环删除。
+六、file_search 的完整执行过程
+MCP：
+results = await sandbox.files.search(
+    SearchEntry(path=path, pattern=pattern)
+)
+代码：
+[server.py (line 577)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:577)
+SDK：
+await search_files.asyncio_detailed(
+    client=client,
+    path=entry.path,
+    pattern=entry.pattern,
+)
+代码：
+[filesystem_adapter.py (line 576)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:576)
+HTTP：
+GET /files/search?path=/workspace&pattern=*.py
+execd：
+filepath.Walk(path, func(...) {
+    match, err := glob.PathMatch(pattern, info.Name())
+
+    if match {
+        files = append(files, fileInfo)
+    }
+})
+代码：
+[filesystem.go (line 342)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem.go:342)
+完整链路：
+file_search
+  ↓
+SearchEntry(path, pattern)
+  ↓
+GET /files/search
+  ↓
+filepath.Walk
+  ↓
+遍历目录中的所有文件
+  ↓
+glob.PathMatch(pattern, info.Name())
+  ↓
+为匹配项构造 FileInfo
+  ↓
+JSON list
+  ↓
+Python EntryInfo list
+  ↓
+MCP JSON
+这个 Tool 的性能风险比较明显
+每次搜索都可能执行完整：
+filepath.Walk(path)
+如果仓库有 100,000 个文件：
+每次 file_search
+  ↓
+重新遍历 100,000 个目录项
+它没有看到：
+- 目录索引
+- 搜索结果缓存
+- 增量文件索引
+- ripgrep 文件枚举
+- Git tracked-files 索引
+所以大仓库中，file_search 很可能是重点瓶颈。
+还要注意：
+glob.PathMatch(pattern, info.Name())
+匹配的是：
+info.Name()
+即文件名，而不是完整相对路径，也不搜索文件内容。
+七、创建和删除目录
+file_create_directories
+MCP：
+await sandbox.files.create_directories(write_entries)
+SDK：
+await make_dirs.asyncio_detailed(
+    body=...
+)
+HTTP：
+POST /directories
+Content-Type: application/json
+execd：
+for dir, perm := range request {
+    MakeDir(dir, perm)
+}
+代码：
+[filesystem.go (line 169)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem.go:169)
+支持多个目录一次创建：
+一次 MCP
+一次 HTTP
+execd 内部顺序创建多个目录
+file_delete_directories
+MCP：
+await sandbox.files.delete_directories(paths)
+SDK：
+await remove_dirs.asyncio_detailed(path=paths)
+HTTP：
+DELETE /directories?path=A&path=B
+execd：
+for _, dir := range paths {
+    os.RemoveAll(resolvedDir)
+}
+代码：
+[filesystem.go (line 195)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem.go:195)
+os.RemoveAll() 会递归删除目录，因此其时间主要取决于目录中文件数量，而不只是 API/MCP 开销。
+八、file_move 的完整执行过程
+MCP：
+await sandbox.files.move_files(entries)
+每个 entry 包含：
+source
+destination
+代码：
+[server.py (line 654)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:654)
+SDK：
+await rename_files.asyncio_detailed(
+    body=rename_items,
+)
+代码：
+[filesystem_adapter.py (line 493)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:493)
+HTTP：
+POST /files/mv
+Content-Type: application/json
+execd：
+for _, renameItem := range request {
+    RenameFile(renameItem)
+}
+代码：
+[filesystem.go (line 143)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem.go:143)
+链路：
+file_move(entries[])
+  ↓
+JSON request
+  ↓
+POST /files/mv
+  ↓
+RenameFiles
+  ↓
+逐项执行移动/重命名
+同样已经支持批量，减少了多个 HTTP RTT。
+九、file_replace_contents 的完整执行过程
+这是 OpenSandbox 中最接近 Claude Code Edit 的 Tool。
+MCP：
+return await sandbox.files.replace_contents_detailed(
+    replace_entries
+)
+代码：
+[server.py (line 678)](D:/code/sandbox-research/OpenSandbox-main/sdks/mcp/sandbox/python/src/opensandbox_mcp/server.py:678)
+SDK：
+await replace_content.asyncio_detailed(
+    body=...,
+    verbose=True,
+)
+代码：
+[filesystem_adapter.py (line 556)](D:/code/sandbox-research/OpenSandbox-main/sdks/sandbox/python/src/opensandbox/adapters/filesystem_adapter.py:556)
+HTTP：
+POST /files/replace?verbose=true
+Content-Type: application/json
+execd 对每个文件执行：
+content, err := os.ReadFile(file)
+
+contentStr := string(content)
+
+newContent := strings.ReplaceAll(
+    contentStr,
+    item.Old,
+    item.New,
+)
+
+err = os.WriteFile(
+    file,
+    []byte(newContent),
+    mode,
+)
+代码：
+[filesystem.go (line 419)](D:/code/sandbox-research/OpenSandbox-main/components/execd/pkg/web/controller/filesystem.go:419)
+完整链路：
+file_replace_contents
+  ↓
+ContentReplaceEntry[]
+  ↓
+POST /files/replace?verbose=true
+  ↓
+JSON 解码
+  ↓
+对每个文件：
+    os.Stat
+    os.ReadFile（整个文件）
+    bytes → string
+    strings.ReplaceAll
+    string → bytes
+    os.WriteFile（重写整个文件）
+  ↓
+返回每个文件的替换次数
+这个 Tool 存在明显优化空间
+即使只替换一行，它也会：
+读取完整文件
+  ↓
+构造完整新字符串
+  ↓
+重写完整文件
+例如修改一个 20 MB 文件中的 10 个字符，仍会处理整个 20 MB。
+而且多个 entry 是顺序处理。
+它也不是“只替换一次”，而是：
+strings.ReplaceAll
+会替换所有匹配内容。
+从安全性上看，它暂时没有像 Claude Code Edit 那样严格要求旧字符串唯一匹配。虽然会返回替换数量，但写入已经发生。
+十、OpenSandbox Server 在链路中的位置
+建议你不要始终画成：
+SDK → OpenSandbox Server → execd
+实际分两种模式。
+默认直连模式
+创建/连接阶段：
+
+Python SDK
+  ↓
+OpenSandbox Server
+  ↓
+获得 execd endpoint
+
+
+文件 Tool 热路径：
+
+MCP
+  ↓
+Python SDK
+  ↓
+直接访问 execd endpoint
+  ↓
+Sandbox FS
+Server Proxy 模式
+启动时配置：
+--use-server-proxy
+调用链才是：
+MCP
+  ↓
+Python SDK
+  ↓
+OpenSandbox Server Proxy
+  ↓
+execd
+  ↓
+Sandbox FS
+所以如果目标是降低时延，具备网络条件时应该优先测：
+direct execd
+vs
+server proxy
+Proxy 模式多一个网络转发 hop，但适合无法直接访问 Sandbox 端口的环境。
+十一、一次文件 Tool 的耗时怎么拆？
+建议你把端到端时间定义为：
+T_total =
+T_mcp_transport
++ T_mcp_parse
++ T_registry_lookup
++ T_sdk_prepare
++ T_http_wait
++ T_execd_route
++ T_filesystem
++ T_response
++ T_mcp_serialize
+具体对应：
+阶段	做什么
+T_mcp_transport	Claude Code 通过 stdio/HTTP 发送 MCP 请求
+T_mcp_parse	FastMCP JSON 解码、参数校验
+T_registry_lookup	根据 sandbox_id 查找 Sandbox 对象
+T_sdk_prepare	构造 query、JSON 或 multipart
+T_http_wait	MCP 主机到 execd 的网络 RTT
+T_execd_route	Gin 路由、中间件、参数解析
+T_filesystem	os.Open、遍历、写入、删除等
+T_response	execd 返回 raw bytes 或 JSON
+T_mcp_serialize	Python 结果序列化为 MCP JSON
+
+
+文件读取还可以细分：
+T_read =
+T_mcp
++ T_http_rtt
++ T_open
++ T_disk_read
++ T_bytes_decode
++ T_json_encode
++ T_return
+文件搜索：
+T_search =
+T_mcp
++ T_http_rtt
++ T_filepath_walk
++ T_glob_match
++ T_file_info
++ T_json_encode
++ T_return
+文件写入：
+T_write =
+T_mcp
++ T_multipart_build
++ T_upload
++ T_multipart_parse
++ T_open_file
++ T_disk_write
++ T_permission
++ T_return
+十二、目前最值得研究的降时延点
+按优先级建议关注这些。
+1. 避免每次 Sandbox.connect
+正常工作流应是：
+sandbox_connect 一次
+  ↓
+ServerState 保存 Sandbox 对象
+  ↓
+后续 Tool 全部复用
+测试时分别测：
+热路径：
+connect_if_missing=False，Sandbox 已注册
+
+冷路径：
+connect_if_missing=True，Sandbox 未注册
+两者不要混在同一个结果里。
+2. 直连 execd，减少 Server Proxy hop
+对比：
+MCP → SDK → execd
+和：
+MCP → SDK → Server Proxy → execd
+记录 P50/P95/P99。
+3. 复用 HTTP Client 和连接
+当前 SDK 已经为 FilesystemAdapter 保存：
+httpx.AsyncClient
+这使 HTTP keep-alive 成为可能。
+需要验证：
+- TCP 连接有没有复用
+- 是否每个 Sandbox 创建一个 client
+- 并发连接池大小
+- HTTP/1.1 还是 HTTP/2
+- 高并发下是否等待连接池
+4. 把 SDK 的批量能力暴露到 MCP
+目前：
+file_delete         支持多路径
+file_move           支持多条目
+file_replace        支持多条目
+create_directories  支持多条目
+但：
+file_write 只支持单文件
+可以增加：
+file_write_many(entries[])
+把：
+N 次 MCP + N 次 HTTP
+变成：
+1 次 MCP + 1 次 multipart HTTP
+5. 为 MCP file_read 暴露 offset/limit
+底层 SDK 和 execd 已经支持按行读取：
+read_file(
+    path,
+    offset=100,
+    limit=50,
+)
+但 MCP 只暴露 range_header。
+增加按行读取能同时降低：
+- execd 返回字节数
+- 网络传输时间
+- Python 内存复制
+- MCP JSON 序列化
+- LLM Token
+6. 优化 file_search
+当前每次都执行：
+filepath.Walk
+大仓库可以考虑：
+- 文件索引
+- Git tracked-file cache
+- 目录缓存
+- 增量索引
+- 使用更快的文件枚举器
+- 限制最大结果数
+- 提前终止
+- 支持批量 pattern
+这是大规模代码仓库最可能出现显著收益的地方。
+7. 优化 file_replace_contents
+当前是：
+整文件读
+整文件复制
+ReplaceAll
+整文件写
+可以考虑：
+- 只允许唯一匹配
+- 支持最大替换次数
+- 小范围 patch
+- 临时文件 + 原子 rename
+- 返回冲突而不是直接 ReplaceAll
+- 多文件并发，但设置并发上限
+8. 限制返回结果
+file_read 和 file_search 返回结果最终都进入 MCP JSON 和模型上下文。
+尤其是：
+file_search → 大量 FileInfo JSON
+file_read   → 大文件字符串
+即使磁盘操作只花 2ms，也可能在：
+JSON serialization
+MCP transport
+LLM context ingestion
+消耗更多时间。
+因此应该支持：
+max_results
+offset/limit
+只返回相对路径
+按需返回 metadata
+截断提示
+十三、建议你第一批怎么测
+先不要跑 pytest 这类业务命令，只测文件链路基础开销。
+测试	目的
+file_read 4 KB	测固定协议开销
+file_read 100 KB	测网络和 JSON
+file_read 1 MB	测大结果成本
+file_read Range 4 KB	与整文件比较
+file_write 4 KB	测固定写入开销
+连续写 10 个文件	验证批量写价值
+file_search 1K 文件	小仓库
+file_search 10K 文件	遍历增长
+file_search 100K 文件	大仓库瓶颈
+file_replace 4 KB	小文件替换
+file_replace 10 MB	验证整文件重写成本
+direct execd	默认热路径
+server proxy	测额外代理开销
+MCP stdio	本地协议基线
+MCP HTTP	MCP 网络模式基线
+
+
+每组记录：
+P50
+P95
+P99
+吞吐量
+返回 bytes
+MCP message bytes
+CPU
+内存
+错误率
+最重要的实验拆分是：
+纯 SDK → execd
+MCP stdio → SDK → execd
+MCP HTTP → SDK → execd
+MCP → SDK → Server Proxy → execd
+由此可以算：
+MCP overhead
+≈ T_MCP - T_SDK
+
+Server Proxy overhead
+≈ T_Proxy - T_Direct
+最终你可以把 OpenSandbox 文件 Tool 的性能判断收敛为：
+当前 OpenSandbox 已经具备 Sandbox 对象复用、HTTP Client 复用、直接 execd 访问、部分批量文件操作和 Range Read，基础热路径并不差。进一步降低时延的主要空间在 MCP 批量接口、按行读取、减少大结果序列化、避免 Server Proxy、文件搜索索引，以及避免文本替换时整文件读写。
