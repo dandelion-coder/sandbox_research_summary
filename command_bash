@@ -9,3 +9,95 @@
 9.execd 通过 SSE 将执行事件流返回给 SDK。
 10.SDK 汇总/解析执行结果，MCP handler 构造 Tool Result。
 11.MCP Server 再通过 stdout 或 Streamable HTTP 返回 Claude Code。
+
+
+Bash 执行通常会额外付出“进程启动成本”
+
+文件 Tool 比如：
+
+file_read
+→ execd handler
+→ open/read
+
+而 Bash：
+
+command_run
+→ execd
+→ 启动 shell
+→ shell 解析 command
+→ 再启动目标程序
+
+比如执行：
+
+grep LoginService -R /workspace
+
+链路可能是：
+
+execd
+↓
+启动 bash/sh
+↓
+bash 解析命令
+↓
+启动 grep 进程
+↓
+grep 遍历文件
+↓
+stdout
+↓
+SSE
+
+所以通常情况下，做相同简单文件操作时：
+
+专用 file Tool
+通常更短、更轻
+
+Bash
+通常多一层 shell + subprocess
+
+理论上 Bash 往往会多出：
+
+shell 启动
++
+命令解析
++
+目标进程创建
++
+stdout/stderr 捕获
+
+所以短小操作的 latency 往往会更高；但如果是一条复杂命令，比如：
+
+grep -R "xxx" src | head -100
+
+Bash 可以一次性把多个操作放进一个进程链里，反而可能减少多次 Tool Call/MCP 往返。因此不能简单说 Bash 永远更慢，关键要看：
+
+一次复杂 command_run
+vs
+多个独立 file Tool Call
+
+这个是你后面性能实验里非常值得做的对比。
+
+
+① 文件 API
+常驻 execd
+→ handler 直接操作文件
+→ 无需启动 shell
+
+② 普通 command_run
+常驻 execd
+→ 每次启动命令/子进程
+→ 适合一次性 Bash
+
+③ Bash Session / PTY
+常驻 execd
+→ 长期保持一个 shell
+→ 多次复用
+→ 保存 cwd / env / shell state
+
+凡是 OpenSandbox MCP 已经显式提供 file_* Tool 的操作，优先直接走 Filesystem API，不需要起 command；凡是需要 Shell 语义、程序执行、管道、压缩、Git、依赖安装、正文 grep 等能力，通常要走 command_run。
+
+
+将高频 Bash 文件操作专用化：通过扩展 MCP Tool 和 Filesystem API，把通用 shell 执行转换为结构化、常驻服务直接执行，从而降低进程启动、协议往返和 Token 开销。
+
+OpenSandbox 你前面分析的是“Claude Code → MCP Server → OpenSandbox SDK → execd”的 MCP 路径；CubeSandbox 官方 Claude Code 集成目前主要不是把 Read/Write/Edit 做成 MCP Tool，而是用 Claude Code PreToolUse Hook 把 Bash 转发到 CubeSandbox。
+
