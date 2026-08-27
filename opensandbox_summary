@@ -247,6 +247,9 @@ stdout / Streamable HTTP
 Claude Code
 
 
+MCP Tool 是给 Claude/Agent 用的接口，SDK 是给程序员/MCP Server 用的接口，execd Filesystem API 是给 SDK 真正调用远端 Sandbox 的底层 HTTP 接口。
+
+
 整个过程可以大致分为 11 个阶段，其中前三个阶段对于 file_read、file_write、file_delete、file_search 等文件 Tool 基本是公共流程。
 
 1. MCP 请求传输。 Claude Code 根据模型生成的 Tool Call，将要调用的 Tool 名称及其参数，例如 file_read、sandbox_id、path、connect_if_missing 等，按照 MCP 规定封装成 JSON-RPC 消息，并通过 MCP transport 发送给 OpenSandbox MCP Server。OpenSandbox 当前支持 stdio 和 Streamable HTTP 两种 transport。stdio 更适合 Claude Code 直接启动本地 MCP Server 子进程的场景，此时双方可以通过 stdin/stdout 通信；Streamable HTTP 更适合 MCP Server 独立部署或远程部署的场景，通过 HTTP 在网络上传输 MCP JSON-RPC 消息。需要注意，transport 的选择由 Claude Code 与 MCP Server 的部署和连接方式决定，而不是由具体 Sandbox 类型决定。
