@@ -247,4 +247,26 @@ stdout / Streamable HTTP
 Claude Code
 
 
+整个过程可以大致分为 11 个阶段，其中前三个阶段对于 file_read、file_write、file_delete、file_search 等文件 Tool 基本是公共流程。
 
+1. MCP 请求传输。 Claude Code 根据模型生成的 Tool Call，将要调用的 Tool 名称及其参数，例如 file_read、sandbox_id、path、connect_if_missing 等，按照 MCP 规定封装成 JSON-RPC 消息，并通过 MCP transport 发送给 OpenSandbox MCP Server。OpenSandbox 当前支持 stdio 和 Streamable HTTP 两种 transport。stdio 更适合 Claude Code 直接启动本地 MCP Server 子进程的场景，此时双方可以通过 stdin/stdout 通信；Streamable HTTP 更适合 MCP Server 独立部署或远程部署的场景，通过 HTTP 在网络上传输 MCP JSON-RPC 消息。需要注意，transport 的选择由 Claude Code 与 MCP Server 的部署和连接方式决定，而不是由具体 Sandbox 类型决定。
+
+2. MCP 请求解析。 MCP Server 接收到 JSON-RPC 消息后，首先完成 JSON 解码和 JSON-RPC 协议校验，然后识别请求中的 MCP 方法，例如 tools/call。对于 Tool 调用，请求中的 params.name 用于定位具体 Tool，如 file_read；随后根据该 Tool 定义的参数 Schema 对 params.arguments 进行字段、类型和约束校验，并将合法参数绑定为 Python 层可使用的参数，最后进入对应的 Tool handler。
+
+3. Sandbox 对象获取。 根据 MCP 请求中解析得到的 sandbox_id，MCP Server 首先在本地 Sandbox Registry 中查找对应的 Sandbox 对象。如果本地已经登记，则直接复用该对象；如果本地不存在且 connect_if_missing=true，则使用同一个 sandbox_id 尝试连接 OpenSandbox 后端已经存在的 Sandbox 实例。连接成功后，在 MCP Server 本地创建并注册对应的 Sandbox 对象，供后续 SDK 操作使用；如果后端也不存在该 sandbox_id，则返回错误。这里不会自动创建新的 Sandbox。
+
+4. SDK 文件读取调用。 MCP Server 将面向 Agent 的 Tool 调用映射为 OpenSandbox Python SDK 方法调用。sandbox_id 在第 3 步已经用于定位 Sandbox 对象，因此在这一阶段主要是将 path、encoding、读取范围等业务参数与该 Sandbox 对象组合，转换为类似 sandbox.files.read_file(path, ...) 的 SDK 调用。Tool 是暴露给 LLM/Agent 的能力接口，而 SDK 是程序访问 OpenSandbox 后端的开发接口，因此 MCP Server 需要在二者之间完成语义和参数映射。
+
+5. execd HTTP 请求构造。 OpenSandbox SDK 根据本地 Sandbox 对象中保存的远端连接信息，以及具体的文件读取参数，构造对应的 execd HTTP 请求，包括目标 endpoint、HTTP Method、URL、Query 参数、Header 以及必要的请求体。对于 file_read，通常会转换为类似 GET /files/download?path=... 的 HTTP 请求。本地 Sandbox 对象本身并不执行文件操作，它只是远端 Sandbox 的 SDK 代理对象。
+
+6. execd HTTP 请求发送与路由解析。 SDK 将构造好的 HTTP 请求发送到目标 Sandbox 内部的 execd 服务。execd 接收到请求后，根据 HTTP Method 和 URL 路径匹配对应的文件操作接口，并解析 Query、Header 或 Request Body 中的参数，然后进入具体的文件处理逻辑。第 5 步重点解决“请求如何构造”，第 6 步重点解决“请求如何发送到 execd，以及 execd 如何找到对应 handler 并解析参数”。
+
+7. Sandbox 文件访问。 execd 根据解析得到的文件路径和读取参数，在 Sandbox 文件系统中定位目标文件，并完成路径合法性、文件存在性及读取权限等检查。检查通过后，打开目标文件并获得文件句柄或读取源，进入实际内容读取阶段。
+
+8. 文件内容 HTTP 返回。 execd 根据完整读取、Range 或 offset/limit 等读取方式从目标文件中取得内容，并将读取结果写入 HTTP Response Body，通过 HTTP 返回给 OpenSandbox SDK。
+
+9. SDK 内容解析与解码。 OpenSandbox SDK 接收到 execd 返回的 HTTP Response 后，首先检查 HTTP 状态码及响应信息，然后读取 Response Body，并按照指定的 encoding 对字节数据进行解码，将其转换为 Python 程序可直接使用的数据类型。例如，文本文件通常最终转换为 Python str。
+
+10. MCP Tool 返回对象构造。 MCP Tool handler 接收 SDK 返回的 Python 数据，根据 file_read Tool 定义的响应结构，将结果封装为 MCP Tool Result，再由 MCP 框架完成相应的序列化。这里需要注意，Python 数据到 MCP Tool Result 的转换由 MCP Server/Tool handler 完成，而不是由 OpenSandbox SDK 完成。
+
+11. MCP 结果返回。 MCP Server 将 MCP Tool Result 封装并序列化为 JSON-RPC Response，通过当前使用的 MCP transport 返回给 Claude Code。stdio 模式下，Server 通过 stdout 返回；Streamable HTTP 模式下，通过 HTTP Response 返回。Claude Code 的 MCP Client 接收到结果后进行解析，并将 Tool Result 放入 Agent Context，供模型继续后续推理。
