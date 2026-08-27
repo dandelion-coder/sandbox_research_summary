@@ -3,7 +3,17 @@
 前三个为公共阶段：
 
 1. MCP请求传输，是 claude code 把想要调用的指令，按照MCP server的协议规定，通过JSON-RPC格式来进行封装，然后通过stdin或者Streamable HTTP来传输，传输的内容里面会包含 功能(file_read,file_write,...)，sandbox_id, path
-  如果Claude Code与这个进程原来就有stdin，stdout，stderr，则可以通过stdio传输，否则是走Streamable HTTP传输，（当前OpenSandbox支持这两个，也允许自己写好的自定义传输方式）
+  如果Claude Code与这个进程原来就有stdin，stdout，stderr，则可以通过stdio传输，否则是走Streamable HTTP传输，（当前OpenSandbox支持这两个，也允许自己写好的自定义传输方式），其实是看MCP server这个进程是不是Claude Code启动的，如果 MCP Server 就运行在 Claude Code 所在的这台机器上，而且由 Claude Code 直接启动，那最适合 stdio，stdio只要求 Claude Code 和 MCP Server 在一个可以建立父子进程 stdin/stdout 的环境里；而如果是独立的MCP server，那么就更适合 Streamable HTTP，需要通过网络把MCP JSON-RPC信息发过去。
+  MCP 官方也把两种 transport 的典型定位概括得很清楚：
+    stdio → local deployments
+    Streamable HTTP → remote deployments
   Claude Code 将 file_read Tool Call 连同 sandbox_id、path、connect_if_missing 等 arguments 封装进 MCP JSON-RPC 消息，并通过 stdio 或 Streamable HTTP 发给 MCP Server
+  不是 Sandbox 选择 stdio 还是 Streamable HTTP，而是 MCP Server 的部署位置和 Claude Code 与 MCP Server 的连接方式决定 transport。
 
-2. MCP请求解析， MCP sever对接收到的JSON-RPC消息进行JSON解码和协议检验，识别出调用的 tools/call 方法，从 params.name 定位出具体的tool，再根据tool的参数schema校验并绑定 params.arguments，最终调用对应的handler，具体来说会检查JSON——RPC协议格式，识别MCP的方法是什么，然后再路由看方法里面的参数，最后tool里的参数schema参数检验，
+2. MCP请求解析， MCP sever对接收到的JSON-RPC消息进行JSON解码和协议检验，识别出调用的 tools/call 方法，从 params.name 定位出具体的tool，再根据tool的参数schema校验并绑定 params.arguments，最终调用对应的handler，具体来说会检查JSON——RPC协议格式，识别MCP的方法是什么，然后再路由看方法里面的参数，最后tool里的参数schema参数检验
+
+3.Sandbox对象获取，根据MCP请求解析出来的sandbox_id，首先会从MCP Sever本地的Sandbox Register里查找对应的sandbox对象，如果本地不存在且connect_if_missing=true，则使用 sandbox_id 连接OpenSandbox后端已存在的 sandbox，并在本地构造、注册对应的sandbox 对象，以供后续的SDK文件操作调用。
+
+
+4.SDK文件读取调用，MCP Server 将面向 Agent 的 Tool 调用转换为面向 OpenSandbox 后端的 SDK 方法调用，具体包括根据 sandbox_id 获取 Sandbox 对象，并将 path、content、pattern 等 Tool 参数映射到对应的 SDK 方法参数。Tool调用是暴露给agent/LLM的能力接口，而SDK则是OpenSandbox给开发者使用的一套程序接口，所以需要进行转换。
+   
