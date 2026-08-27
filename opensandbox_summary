@@ -19,6 +19,232 @@
 
 5.Exced HTTP 请求准备与发送，OpenSandbox SDK根据本地的sandbox对象保存的Sandbox连接信息，将文件操作转换为对应的exced HTTP请求，发送到目标sandbox内部的execd服务，并由远端环境真正执行文件操作。本地的sandbox只是远端sandbox的一个SDK代理对象，本身不执行文件操作，实际读写删搜操作由 SDK 通过 HTTP 请求发送到远端 Sandbox 内的 execd 服务执行。真正接受信息的是execd
 
-6.Exced HTTP请求发送，OpenSandbox SDK将构造好的HTTP请求发送到目标Sandbox内部的execd服务，exced接受到请求后，根据HTTP method和URL路径匹配对应的文件操作接口（因为不同的文件操作会有不同的解析方式），并解析Query，Header或Request Body参数，进入具体的文件处理逻辑
+6.Exced HTTP请求发送，OpenSandbox SDK将构造好的HTTP请求发送到目标Sandbox内部的execd服务，exced接受到请求后，根据HTTP method和URL路径匹配对应的文件操作接口（因为不同的文件操作会有不同的解析方式），并解析Query，Header或Request Body参数，进入具体的文件处理逻辑。
+第5步：SDK准备HTTP请求 → 构造URL、Query、Header、Body；第6步：HTTP发送 + execd接收 → 请求发到远端execd → execd路由匹配 → 参数解析。
+第 5 步解决“请求怎么构造”，第 6 步解决“请求怎么到达 execd，并由 execd 找到对应接口进行解析”。
+
+
+7.Sandbox文件访问，exced服务根据第6步解析得到的文件路径及读取参数，在sandbox内部定位并打开目标文件，同时检查文件是否存在、路径是否合法以及当前进程是否具有读取权限；检查通过后获得文件句柄或读取源，进入后续内容读取阶段。
+
+
+8.文件内容HTTP返回，execd服务根据读取参数从目标文件中取得内容之后，将文件内容写入HTTP Response Body，并通过HTTP返回给OpenSandbox SDK。
+
+9.SDK内容解析与解码，OpenSandbox SDK 接收execd 返回的HTTP Response后，先检查HTTP状态码和响应信息，再读取Response Body，并按照encoding将字节数据解码为python可直接使用的数据类型，例如文本场景下的str。SDK 对 execd 返回的 HTTP Response 进行状态检查、内容读取和编码解码，将返回结果转换为 Python 程序可直接使用的数据。
+
+10.MCP Tool返回对象构造，MCP Sever接收SDK返回的python可直接使用的数据，根据tool file_read定义的响应模型，将其封装为MCP Tool的结构化输出格式，MCP Tool Result，再由MCP框架完成序列化。
+
+11.MCP server 将 MCP Tool Result 序列化为 JSON-RPC Response，并通过当前 MCP transport 返回给 Claude Code；stdio 模式下经 stdout 返回，Streamable HTTP 模式下经 HTTP 响应返回，最终由 Claude Code MCP Client 解析并放入 Agent Context。
+
+
+公共阶段
+1. MCP 请求传输
+2. MCP 请求解析
+3. Sandbox 对象获取
+        ↓
+执行阶段
+4. Tool → SDK 接口映射
+5. SDK 构造 execd HTTP 请求
+6. HTTP 发送 + execd 路由解析
+7. Sandbox 文件系统实际操作
+        ↓
+返回阶段
+8. execd HTTP 返回
+9. SDK 解析为 Python 数据
+10. MCP Tool Result 构造
+11. JSON-RPC Response 返回 Claude Code
+
+Claude Code
+    │
+    │ 1. MCP Tool Call
+    │    file_read
+    │    sandbox_id
+    │    path
+    │    connect_if_missing
+    ▼
+┌──────────────────────────────┐
+│ MCP JSON-RPC Request         │
+│ method = tools/call          │
+│ params.name = file_read      │
+│ params.arguments = {...}     │
+└──────────────────────────────┘
+    │
+    │ stdio
+    │ 或 Streamable HTTP
+    ▼
+OpenSandbox MCP Server
+    │
+    │ 2. MCP 请求解析
+    │
+    ├─ JSON 解码
+    ├─ JSON-RPC 协议校验
+    ├─ 识别 method = tools/call
+    ├─ params.name → file_read
+    ├─ 参数 Schema 校验
+    └─ arguments → Python 参数
+    │
+    ▼
+3. Sandbox 对象获取
+    │
+    ├─ 根据 sandbox_id
+    │  查询 MCP Server 本地 Registry
+    │
+    ├─ 已存在
+    │      ↓
+    │   直接取得 Sandbox 对象
+    │
+    └─ 不存在
+           ↓
+       connect_if_missing ?
+          /          \
+       false          true
+         │             │
+        报错       用相同 sandbox_id
+                     ↓
+                连接后端已有
+                Sandbox 实例
+                     ↓
+                构造本地
+                Sandbox 对象
+                     ↓
+                注册到 Registry
+    │
+    ▼
+4. SDK 接口映射
+    │
+    │ Tool:
+    │ file_read(sandbox_id, path, ...)
+    │
+    │ 转换为
+    ▼
+sandbox.files.read_file(path, ...)
+    │
+    ▼
+OpenSandbox Python SDK
+    │
+    │ 5. 构造 execd HTTP 请求
+    │
+    ├─ endpoint
+    ├─ URL
+    ├─ Query
+    ├─ Header
+    └─ Body（如需要）
+    │
+    ▼
+GET /files/download?path=...
+    │
+    │ 6. HTTP 发送
+    ▼
+远端 Sandbox 内 execd
+    │
+    ├─ 接收 HTTP Request
+    ├─ 根据 Method + URL 路由
+    ├─ 找到文件读取 Handler
+    └─ 解析 Query / Header / Body
+    │
+    ▼
+7. Sandbox 文件访问
+    │
+    ├─ 定位目标文件
+    ├─ 检查路径是否合法
+    ├─ 检查文件是否存在
+    ├─ 检查读取权限
+    └─ 打开并读取文件
+    │
+    ▼
+Sandbox Filesystem
+    │
+    │ 文件内容
+    ▼
+8. execd HTTP Response
+    │
+    ├─ 文件内容写入 Response Body
+    └─ HTTP 返回
+    │
+    ▼
+OpenSandbox Python SDK
+    │
+    │ 9. SDK 内容解析
+    │
+    ├─ 检查 HTTP Status
+    ├─ 读取 Response Body
+    ├─ encoding 解码
+    └─ bytes → Python str
+    │
+    ▼
+Python 数据
+    │
+    ▼
+10. MCP Tool Handler
+    │
+    ├─ Python 数据
+    ├─ 封装 Tool Response
+    └─ 构造 MCP Tool Result
+    │
+    ▼
+MCP Tool Result
+    │
+    ▼
+11. MCP Server
+    │
+    ├─ 序列化为 JSON-RPC Response
+    │
+    └─ 返回 Claude Code
+    │
+    ├──────── stdio 模式
+    │         stdout
+    │
+    └──────── Streamable HTTP 模式
+              HTTP Response
+    │
+    ▼
+Claude Code MCP Client
+    │
+    ├─ 解析 JSON-RPC Response
+    └─ Tool Result 放入 Agent Context
+    │
+    ▼
+Claude / Agent 继续推理
+
+
+Claude Code
+    ↓
+MCP JSON-RPC Tool Call
+    ↓
+stdio / Streamable HTTP
+    ↓
+OpenSandbox MCP Server
+    ↓
+JSON-RPC解析 + Tool路由 + 参数校验
+    ↓
+sandbox_id → Sandbox对象
+    ↓
+Tool Call → SDK Call
+    ↓
+OpenSandbox Python SDK
+    ↓
+构造 execd HTTP Request
+    ↓
+远端 Sandbox / execd
+    ↓
+HTTP路由 + 参数解析
+    ↓
+Sandbox 文件系统
+    ↓
+真实文件操作
+    ↓
+HTTP Response
+    ↓
+OpenSandbox SDK
+    ↓
+Python 数据
+    ↓
+MCP Tool Result
+    ↓
+JSON-RPC Response
+    ↓
+stdout / Streamable HTTP
+    ↓
+Claude Code
+
 
 
