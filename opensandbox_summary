@@ -1,0 +1,9 @@
+总的阶段可以大致分为11个
+
+前三个为公共阶段：
+
+1. MCP请求传输，是 claude code 把想要调用的指令，按照MCP server的协议规定，通过JSON-RPC格式来进行封装，然后通过stdin或者Streamable HTTP来传输，传输的内容里面会包含 功能(file_read,file_write,...)，sandbox_id, path
+  如果Claude Code与这个进程原来就有stdin，stdout，stderr，则可以通过stdio传输，否则是走Streamable HTTP传输，（当前OpenSandbox支持这两个，也允许自己写好的自定义传输方式）
+  Claude Code 将 file_read Tool Call 连同 sandbox_id、path、connect_if_missing 等 arguments 封装进 MCP JSON-RPC 消息，并通过 stdio 或 Streamable HTTP 发给 MCP Server
+
+2. MCP请求解析， MCP sever对接收到的JSON-RPC消息进行JSON解码和协议检验，识别出调用的 tools/call 方法，从 params.name 定位出具体的tool，再根据tool的参数schema校验并绑定 params.arguments，最终调用对应的handler，具体来说会检查JSON——RPC协议格式，识别MCP的方法是什么，然后再路由看方法里面的参数，最后tool里的参数schema参数检验，
