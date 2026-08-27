@@ -36,6 +36,8 @@
 11.MCP server 将 MCP Tool Result 序列化为 JSON-RPC Response，并通过当前 MCP transport 返回给 Claude Code；stdio 模式下经 stdout 返回，Streamable HTTP 模式下经 HTTP 响应返回，最终由 Claude Code MCP Client 解析并放入 Agent Context。
 
 
+Claude Code 与 MCP Server 之间使用 MCP 语义下的 JSON-RPC 消息进行通信，消息通过 stdio 或 Streamable HTTP transport 传输；MCP Server 在内部调用 OpenSandbox SDK，SDK 再把高层文件操作转换为面向远端 Sandbox 内 execd 的 HTTP API 请求。execd 执行真实文件系统操作后，通过 HTTP Response 返回结果，SDK 再把 HTTP 响应解析、解码成 Python 可直接使用的数据，最后交给 MCP Server 封装成 MCP Tool Result 返回给 Claude Code。
+
 公共阶段
 1. MCP 请求传输
 2. MCP 请求解析
