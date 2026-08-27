@@ -101,3 +101,121 @@ vs
 
 OpenSandbox 你前面分析的是“Claude Code → MCP Server → OpenSandbox SDK → execd”的 MCP 路径；CubeSandbox 官方 Claude Code 集成目前主要不是把 Read/Write/Edit 做成 MCP Tool，而是用 Claude Code PreToolUse Hook 把 Bash 转发到 CubeSandbox。
 
+
+
+OpenSandbox command_run / Bash 调用流程
+
+1. MCP 请求传输。 Claude Code 根据模型生成的 Tool Call，将要调用的 Tool 名称及参数，例如 command_run、sandbox_id、command、cwd、timeout、background 等，按照 MCP 协议封装为 JSON-RPC 消息，并通过 stdio 或 Streamable HTTP 发送给 OpenSandbox MCP Server。这里的 transport 选择逻辑与 file_read 完全一致：本地子进程场景更适合 stdio，独立或远程 MCP Server 更适合 Streamable HTTP。MCP transport 只负责 Claude Code 与 MCP Server 之间的通信，与具体 Sandbox 类型无关。
+
+2. MCP 请求解析。 MCP Server 接收到 JSON-RPC 消息后，首先进行 JSON 解码和 JSON-RPC 协议校验，然后识别 MCP 方法，例如 tools/call。对于 Tool 调用，根据 params.name 找到 command_run Tool，再按照对应 Tool 的参数 Schema 对 params.arguments 进行字段、类型和约束校验，例如检查 sandbox_id、command、cwd、timeout 等参数是否合法，最后将参数绑定为 Python 层可使用的数据并进入对应的 Tool handler。
+
+3. Sandbox 对象获取。 MCP Server 根据解析得到的 sandbox_id，首先在本地 Sandbox Registry 中查找对应的 Sandbox 对象。如果本地已经登记，则直接复用；如果本地不存在且 connect_if_missing=true，则使用同一个 sandbox_id 尝试连接 OpenSandbox 后端已经存在的 Sandbox 实例。连接成功后，在 MCP Server 本地创建并注册对应的 Sandbox 对象；如果后端也不存在该 sandbox_id，则返回错误。这一步与 file_read 等文件 Tool 基本相同。
+
+4. SDK 命令执行调用。 MCP Server 将面向 Agent 的 command_run Tool 调用映射为 OpenSandbox Python SDK 的命令执行接口调用。第 3 步获得的 Sandbox 对象与 command、cwd、timeout、background、环境变量等业务参数组合，形成类似 sandbox.commands.run(...) 的 SDK 调用。Tool 负责向 Agent 表达“执行一条命令”的能力，SDK 则负责用程序接口访问 OpenSandbox 的命令执行服务。
+
+5. execd HTTP 请求构造。 OpenSandbox SDK 根据 Sandbox 对象中保存的远端连接信息和命令参数，构造发往 Sandbox 内 execd 的 HTTP 请求。普通命令执行对应 execd 的 POST /command 接口，请求体通常采用 JSON，包含 command、cwd、background、timeout、uid/gid、envs 等参数。execd 的 /command 接口用于执行 Shell 命令，并支持前台、后台以及超时控制。
+
+6. execd HTTP 请求发送与路由解析。 SDK 将构造好的 HTTP 请求发送到目标 Sandbox 内部常驻的 execd 服务。execd 接收到 POST /command 请求后，根据 HTTP Method 和 URL 匹配 Command handler，并解析 Request Body 中的命令、工作目录、环境变量、用户身份、超时时间以及前后台执行方式等参数，然后进入真正的命令执行逻辑。这里和文件 Tool 的区别是：file_read 进入 Filesystem handler，而 command_run 进入 Command handler。
+
+7. Sandbox 内启动并执行命令。 execd 根据解析后的参数，在 Sandbox 内启动对应的 Shell/子进程执行命令。对于 Shell-backed session，OpenSandbox 优先使用 Bash；如果镜像中没有 Bash，则回退到 sh。因此这里不再是 Filesystem handler 直接 open/read 文件，而是由 execd 启动实际命令进程，再由该进程访问文件系统、网络或其他系统资源。
+
+例如：
+
+command = "grep ERROR /workspace/app.log"
+        ↓
+execd Command Handler
+        ↓
+启动 shell / command process
+        ↓
+执行 grep
+        ↓
+Linux 文件系统
+
+8. 命令输出流返回。 命令运行后会产生 stdout、stderr、执行状态以及完成事件。execd 的 POST /command 并不是简单等命令全部结束后一次性返回，而是使用 SSE（Server-Sent Events）实时流式返回命令执行事件，因此调用方可以边执行边接收输出。
+
+其过程可以理解为：
+
+Command Process
+↓
+stdout / stderr / status
+↓
+execd
+↓
+SSE event stream
+↓
+OpenSandbox SDK
+
+9. SDK 命令结果解析。 OpenSandbox SDK 接收到 execd 返回的 SSE 事件流后，持续解析不同类型的执行事件，并收集 stdout、stderr、执行状态、exit code 等信息。对于前台命令，SDK 最终将这些事件整理成 Python 层可直接使用的命令执行结果；对于后台命令，则可能返回执行 ID 或状态信息，供后续查询。
+
+10. MCP Tool 返回对象构造。 command_run 的 MCP Tool handler 接收 SDK 返回的 Python 命令执行结果，根据该 Tool 定义的响应结构，将 stdout、stderr、exit code、执行状态等数据封装为 MCP Tool Result，再由 MCP 框架完成序列化。和 file_read 一样，这一步是 MCP Server/Tool handler 负责，而不是 SDK 自己负责。
+
+11. MCP 结果返回。 MCP Server 将构造完成的 MCP Tool Result 序列化为 JSON-RPC Response，并通过当前 MCP transport 返回给 Claude Code。stdio 模式下通过 stdout 返回；Streamable HTTP 模式下通过 HTTP 响应返回。Claude Code 的 MCP Client 解析返回结果并将其放入 Agent Context，模型随后可以根据命令输出继续推理或决定下一步 Tool Call。
+
+整体链路可以压缩成：
+
+Claude Code
+↓
+MCP command_run Tool Call
+↓
+JSON-RPC
+↓
+stdio / Streamable HTTP
+↓
+OpenSandbox MCP Server
+↓
+JSON-RPC解析 + Tool路由 + 参数校验
+↓
+sandbox_id → Sandbox对象
+↓
+Tool Call → SDK Call
+↓
+sandbox.commands.run(...)
+↓
+OpenSandbox Python SDK
+↓
+构造 POST /command
+↓
+远端 Sandbox / execd
+↓
+Command Handler
+↓
+启动 Shell / 子进程
+↓
+执行实际 Bash 命令
+↓
+stdout / stderr / status
+↓
+SSE Stream
+↓
+OpenSandbox SDK
+↓
+Python Command Result
+↓
+MCP Tool Result
+↓
+JSON-RPC Response
+↓
+stdout / Streamable HTTP
+↓
+Claude Code
+
+和 file_read 对比，真正不同的是第 5～9 步：
+
+file_read:
+SDK
+→ GET /files/download
+→ execd Filesystem Handler
+→ open/read
+→ HTTP Response
+→ SDK decode
+
+command_run:
+SDK
+→ POST /command
+→ execd Command Handler
+→ 启动 Shell / 子进程
+→ stdout/stderr
+→ SSE Stream
+→ SDK 聚合结果
+
+所以从性能上看，command_run("cat file") 比直接 file_read 多了 命令调度、Shell/子进程启动、stdout/stderr 捕获、SSE 事件处理 等环节；这也是为什么固定文件操作通常更适合直接走 Filesystem API，而不是绕到 Bash。
