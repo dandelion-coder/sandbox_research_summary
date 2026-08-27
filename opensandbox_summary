@@ -16,4 +16,9 @@
 
 
 4.SDK文件读取调用，MCP Server 将面向 Agent 的 Tool 调用转换为面向 OpenSandbox 后端的 SDK 方法调用，具体包括根据 sandbox_id 获取 Sandbox 对象，并将 path、content、pattern 等 Tool 参数映射到对应的 SDK 方法参数。Tool调用是暴露给agent/LLM的能力接口，而SDK则是OpenSandbox给开发者使用的一套程序接口，所以需要进行转换。
-   
+
+5.Exced HTTP 请求准备与发送，OpenSandbox SDK根据本地的sandbox对象保存的Sandbox连接信息，将文件操作转换为对应的exced HTTP请求，发送到目标sandbox内部的execd服务，并由远端环境真正执行文件操作。本地的sandbox只是远端sandbox的一个SDK代理对象，本身不执行文件操作，实际读写删搜操作由 SDK 通过 HTTP 请求发送到远端 Sandbox 内的 execd 服务执行。真正接受信息的是execd
+
+6.Exced HTTP请求发送，OpenSandbox SDK将构造好的HTTP请求发送到目标Sandbox内部的execd服务，exced接受到请求后，根据HTTP method和URL路径匹配对应的文件操作接口（因为不同的文件操作会有不同的解析方式），并解析Query，Header或Request Body参数，进入具体的文件处理逻辑
+
+
