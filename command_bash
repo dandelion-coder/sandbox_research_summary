@@ -1,0 +1,11 @@
+1.Claude Code 把 command_run、sandbox_id、command 等封装成 MCP JSON-RPC。
+2.MCP Server 解析、校验、匹配 command_run handler。
+3.根据 sandbox_id 获取 Sandbox 对象。
+4.Tool 调用映射成 SDK 命令执行接口。
+5.SDK 构造 execd HTTP 请求，例如 POST /command。
+6.请求发送到远端 Sandbox 的 execd，execd 根据 /command 路由解析命令参数。
+7.execd 启动 shell/子进程执行命令。
+8.命令运行过程中产生 stdout/stderr/status。
+9.execd 通过 SSE 将执行事件流返回给 SDK。
+10.SDK 汇总/解析执行结果，MCP handler 构造 Tool Result。
+11.MCP Server 再通过 stdout 或 Streamable HTTP 返回 Claude Code。
