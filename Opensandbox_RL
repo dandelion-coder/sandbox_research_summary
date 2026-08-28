@@ -9,3 +9,700 @@ Claude Code 会调用几十/几百次 Tool
 哪些进程/连接可以复用？
 哪些 Bash 操作可以变成原生 Tool？
 哪些初始化成本可以提前完成？
+
+########################################################################################################################################
+面向 Coding Agent RL 训练的 OpenSandbox 低时延工具执行机制研究，通过减少 MCP/HTTP 往返、复用 Sandbox 与 Shell 执行上下文、将高频 Bash 操作下沉为原生 Filesystem Tool，并结合 warm pool 与 snapshot 降低 rollout 环境初始化和工具调用开销。
+不是让某一个函数“执行更快”，而是把 RL rollout 中不断重复发生的初始化、连接、Shell 启动、SSE 等固定成本，从高频路径中移出去。
+########################################################################################################################################
+
+二、我认为最值得做的第一优先级：解决 command_run 的固定尾延迟
+
+这个是目前最明确、证据最充分的优化点。
+
+现在 /command 路径是：
+
+命令完成
+↓
+execution_complete
+↓
+event flush
+↓
+grace sleep ≈ 1s
+↓
+SSE真正关闭
+↓
+SDK return
+
+对于：
+
+pwd
+ls
+git status
+cat xxx
+grep xxx
+
+这种 RL Agent 高频调用，命令本身可能只有几毫秒或几十毫秒，但是尾巴可能多出接近 1 秒。
+
+所以第一条实验线应该就是：
+
+方案 A：客户端收到 execution_complete 后立即返回
+
+也就是：
+
+execd
+↓
+execution_complete
+↓
+SDK认为命令已经完成
+↓
+立即返回给MCP
+↓
+Claude Code继续下一步
+
+服务端那 1 秒可以继续执行，但不进入关键路径。
+
+这个方向我认为非常适合作为你的第一项优化，因为：
+
+改动不算特别大；
+原理非常明确；
+能直接测出来；
+对短命令提升可能非常明显；
+当前 background command 本身已经存在收到 complete 后 early break 的类似逻辑。
+
+然后再进一步测：
+
+1s
+500ms
+100ms
+50ms
+0ms
+
+比较 safety 和 latency。
+
+三、第二个非常重要的方向：不要每条 Bash 都重新启动 Shell
+
+Claude Code 做 coding agent 任务的时候会产生非常多这种命令：
+
+pwd
+ls
+git status
+grep xxx
+pytest xxx
+python xxx
+
+如果每一次都是：
+
+command_run
+↓
+POST /command
+↓
+execd
+↓
+创建新的Shell
+↓
+执行
+↓
+Shell退出
+
+就意味着每次都重复付 Shell/process startup 成本。
+
+OpenSandbox 已经提供 Bash session：
+
+POST /session
+↓
+创建长期 Bash session
+
+POST /session/{id}/run
+↓
+不断复用同一个Shell
+
+而 session 能保持：
+
+cwd
+environment
+shell state
+
+OpenSandbox 的 API 就明确支持这种 stateful Bash session。
+
+所以你可以比较：
+
+方案1：
+
+100条命令
+= 启动100次Shell
+
+和：
+
+方案2：
+
+启动1次Shell
++
+执行100条命令
+
+对于 RL rollout，这个方向特别合理：
+
+一个 rollout
+↓
+一个 Sandbox
+↓
+一个 Bash Session
+↓
+这个 episode 内全部复用
+↓
+episode结束再销毁
+
+这可能成为一个非常自然的 RL Sandbox execution model。
+
+四、第三个优先级：把高频 Bash 文件操作改成原生 Filesystem Tool
+
+这个方向跟你组长最初让你研究 Claude Code 文件 Tool 非常相关。
+
+例如 Claude Code 可能大量产生：
+
+cat file.py
+grep "xxx" file.py
+find . -name "*.py"
+rm file
+mkdir xxx
+mv a b
+sed ...
+
+但这些里面很多实际上不是“真正需要 Shell”。
+
+例如：
+
+cat
+→ file_read
+
+find path
+→ file_search
+
+rm
+→ file_delete
+
+mv
+→ file_move
+
+mkdir
+→ file_create_directories
+
+OpenSandbox MCP 当前已经提供这些 filesystem tools。
+
+这样路径从：
+
+MCP
+→ SDK
+→ execd
+→ Shell
+→ subprocess
+→ 文件系统
+→ stdout
+→ SSE
+
+变成：
+
+MCP
+→ SDK
+→ execd
+→ Filesystem handler
+→ 文件系统
+→ HTTP response
+
+直接省掉：
+
+Shell启动
+子进程启动
+stdout捕获
+stderr捕获
+SSE
+五、真正值得你进一步开发的是“任务特定 Tool”
+
+OpenSandbox 当前 filesystem Tool 还不够覆盖 coding agent 高频操作。
+
+一个非常典型的例子：
+
+grep -R "XXX" .
+
+OpenSandbox 当前 file_search 主要是：
+
+glob路径搜索
+
+而不是文件内容搜索。
+
+所以 Claude Code 还是会：
+
+command_run("grep ...")
+
+你可以新增：
+
+file_search_content
+
+路径：
+
+Claude Code
+↓
+MCP file_search_content
+↓
+SDK
+↓
+execd Filesystem API
+↓
+直接遍历/搜索内容
+
+而不是：
+
+Claude Code
+↓
+command_run
+↓
+Shell
+↓
+grep process
+
+类似还可以做：
+
+read_many
+write_many
+stat_many
+search_content
+apply_patch
+list_tree
+replace_many
+
+这类 Tool 对 RL coding agent 很有意义，因为它们具有：
+
+高频
+固定
+结构化
+可预测
+
+这样的操作最适合从 Bash 提升成 native Tool。
+
+六、第四个方向：减少 Tool Call 次数，而不只是优化单次 Tool Call
+
+这个我认为非常重要，而且容易被忽略。
+
+比如模型要读 10 个文件：
+
+现在：
+
+file_read A
+↓
+一次MCP
+一次HTTP
+
+file_read B
+↓
+一次MCP
+一次HTTP
+
+...
+
+10次
+
+即：
+
+10 ×
+MCP
++
+SDK
++
+HTTP
++
+execd route
+
+你可以提供：
+
+file_read_many(
+    [a.py, b.py, c.py, ...]
+)
+
+变成：
+
+1次MCP
+↓
+1次SDK
+↓
+1次HTTP
+↓
+execd批量读10个文件
+
+这对于 RL 特别重要，因为 Tool Call 次数很多。
+
+同样可以有：
+
+stat_many
+read_many
+delete_many
+search_many
+
+甚至 coding agent 专用：
+
+inspect_repo(
+    glob="**/*.py",
+    query="ClassName"
+)
+
+一个 Tool 同时：
+
+搜索路径
++
+搜索内容
++
+返回相关代码片段
+
+这其实是在减少：
+
+Agent ↔ Sandbox round-trip 次数。
+
+很多时候，减少 10 次 round trip 比单次优化 5ms 更有意义。
+
+七、第五个方向：让 Sandbox Object、SDK Client 和 HTTP Connection 全部复用
+
+这个属于基础设施层优化。
+
+你之前已经研究到：
+
+sandbox_id
+↓
+Sandbox Registry
+↓
+Sandbox Object
+
+那么 RL rollout 里不要每次：
+
+查不到
+↓
+connect
+↓
+重新创建Sandbox proxy
+↓
+重新建立HTTP连接
+
+而应该变成：
+
+episode开始
+↓
+sandbox_id绑定
+↓
+Sandbox Object长期驻留
+↓
+整个episode复用
+
+同时 SDK HTTP client 也必须复用。
+
+OpenSandbox 官方 Python SDK 本身明确建议，在大量 Sandbox 实例情况下配置共享 transport，以优化资源使用，并支持 HTTP keep-alive / connection pool。
+
+理想状态：
+
+Claude rollout
+↓
+固定MCP Server
+↓
+固定Sandbox object
+↓
+固定SDK client
+↓
+固定HTTP connection pool
+↓
+固定execd
+
+避免频繁：
+
+TCP connect
+TLS handshake
+client create
+Sandbox connect
+
+这在高并发 RL 训练时尤其重要。
+
+八、第六个方向：MCP 层本身也可以优化，但优先级没前几个高
+
+Claude Code ↔ MCP Server：
+
+JSON-RPC
+↓
+stdio / Streamable HTTP
+
+如果 MCP Server 和 Claude Code 在同一机器：
+
+stdio
+
+一般更适合作为低延迟 baseline，因为少了一层 HTTP Server/网络栈。
+
+OpenSandbox 官方也支持 Claude Code 通过 stdio 连接 MCP Server。
+
+不过这里我不建议你一开始花大量时间优化 JSON-RPC 序列化。
+
+因为相比：
+
+1s SSE tail
+Shell启动
+HTTP roundtrip
+重复Tool Call
+
+JSON encode/decode 很可能不是主要瓶颈。
+
+正确顺序应该是先测：
+
+T_MCP parse
+T_HTTP
+T_exec
+
+再决定。
+
+九、第七个方向：给短命令设计 Fast Command Path
+
+这个是你刚才 SSE 讨论自然延伸出来的方向。
+
+目前：
+
+所有前台command
+↓
+SSE
+
+但：
+
+pwd
+true
+echo hello
+git rev-parse HEAD
+
+这类命令根本没有太强的 streaming 需求。
+
+可以考虑：
+
+POST /command/sync
+
+或者：
+
+stream=false
+
+走：
+
+command
+↓
+exec
+↓
+收集stdout/stderr
+↓
+普通HTTP Response
+
+而：
+
+pytest
+pip install
+python train.py
+
+继续：
+
+SSE
+
+形成：
+
+短命令
+→ sync fast path
+
+长命令
+→ SSE
+
+不过这里有一个困难：
+
+你不知道一条命令到底是不是短命令。
+
+所以更实际的设计可能是：
+
+Tool层显式选择
+
+例如：
+
+command_run_sync
+command_run_streaming
+
+Agent/runtime 根据操作类型选。
+
+十、第八个方向：进一步绕过 Shell，做 Direct Exec
+
+这个比“persistent Bash session”更进一步。
+
+现在：
+
+execd
+↓
+bash -c "..."
+↓
+command
+
+对于：
+
+ls
+pwd
+git status
+python test.py
+
+很多情况下其实可以：
+
+execd
+↓
+直接 execve(program, argv)
+
+例如：
+
+command_exec(
+    executable="/usr/bin/git",
+    args=["status"]
+)
+
+不经过：
+
+bash
+
+可以省：
+
+bash startup
+bash parsing
+shell expansion
+
+这很像：
+
+shell execution
+vs
+direct process execution
+
+对于 coding agent 的大量短命令，值得做 benchmark。
+
+当然，这个接口无法完全替代：
+
+cat a | grep b
+cd xxx && pytest
+VAR=1 python x.py
+
+这种真正依赖 Shell semantics 的命令。
+
+所以可以：
+
+简单命令
+→ direct exec
+
+复杂命令
+→ Bash session
+十一、RL 场景里一个更大的优化点：Sandbox warm pool
+
+上面讲的都是“单次 Tool Call”。
+
+但 RL 训练里还有一个更大的延迟：
+
+每个episode
+↓
+创建Sandbox
+↓
+拉镜像
+↓
+启动
+↓
+clone repo
+↓
+pip install
+↓
+准备环境
+
+如果这部分每个 rollout 都重新做，Tool 优化几十毫秒意义会被淹没。
+
+所以 RL 环境应该考虑：
+
+提前准备N个Sandbox
+↓
+warm pool
+↓
+rollout需要时直接拿
+
+OpenSandbox 本身已经有 SandboxPool，而且目前官方 issue 里甚至在讨论 warmup concurrency。
+
+所以：
+
+RL worker
+↓
+Acquire warm sandbox
+↓
+run rollout
+↓
+reset / recycle
+
+而不是：
+
+create from scratch
+十二、比 warm pool 更进一步：Snapshot
+
+coding agent RL 通常环境非常重复：
+
+同一镜像
+同一repo
+同一依赖
+不同task
+
+那么可以：
+
+安装好所有依赖
+↓
+clone好repo
+↓
+创建snapshot
+↓
+每个episode从snapshot恢复
+
+OpenSandbox 当前的 snapshot 方向本身就在支持“按 toolchain + repository revision 建 warm snapshot cache”，官方 issue 甚至明确提到目标是避免重复 clone 和 provision，把 cold start 从分钟级降到秒级。
+
+这和 RL 场景几乎完全吻合。
+
+例如：
+
+snapshot key =
+image
++
+repo_commit
++
+dependency_version
+
+一个 RL batch：
+
+100个 rollout
+↓
+全部从同一个snapshot fork/restore
+
+而不是安装 100 次依赖。
+
+十三、RL 场景还有一个非常关键的方向：环境复用 + 快速 reset
+
+如果是 RL：
+
+episode1
+修改文件
+执行代码
+结束
+
+下一条 rollout 需要回到干净状态。
+
+最差方案：
+
+kill Sandbox
+↓
+create Sandbox
+↓
+重新准备
+
+更好的：
+
+snapshot
+↓
+restore
+
+或者未来如果 runtime 支持：
+
+overlay filesystem
+↓
+丢弃upper layer
+↓
+瞬间reset
+
+这对 RL throughput 的影响可能比单次 tool call 更大。
+
