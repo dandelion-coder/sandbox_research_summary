@@ -1,0 +1,972 @@
+这 1 秒不是必须被客户端同步等待的。它是 execd 在 final SSE event 已经 flush 后保留连接的 graceful-shutdown 时间。你既可以缩短这个配置，也可以修改 SDK，让客户端收到 execution_complete 后立即返回，从而把这 1 秒从关键路径中移除，让服务端 grace period 与后续工作并行。当前 OpenSandbox 的后台 command 已经采用了类似 early-break 思路，而 RunCode/RunInSession 也已经去掉固定 tail sleep，因此这是一个有现实代码依据的优化方向。
+
+
+### OpenSandbox command_run 的 1 秒尾延迟优化方案
+
+方案一：缩短服务端 graceful shutdown 等待时间。OpenSandbox 当前在 `POST /command` 执行完成并发送最终 SSE 事件后，会继续等待一段 graceful shutdown 时间，默认约为 1 秒。最直接的优化方式是通过配置将该时间缩短，例如调整为 100ms、50ms 或更低，从而减少短命令的固定尾延迟。该方案实现最简单，通常只需要修改配置，不需要调整 SDK 或 MCP 逻辑，但需要验证缩短等待时间后是否会导致 SSE 事件丢失、连接提前关闭或下游组件状态同步异常。
+
+方案二：客户端收到完成事件后提前返回。该方案保留 execd 服务端原有的 1 秒 graceful shutdown 时间，但修改 OpenSandbox SDK 的 SSE 消费逻辑，使前台命令在收到 `execution_complete` 等终态事件后立即结束等待并返回结果，而不是继续等待 SSE 连接真正关闭。这样服务端仍然可以在后台完成原有的 graceful cleanup，而 MCP Server 和 Claude Code 可以立即继续后续工作，从而将这 1 秒等待移出关键执行路径。该方案需要修改 SDK，执行难度中等，但相比直接删除服务端等待，兼顾了性能和安全性，优先级较高。
+
+方案三：服务端与客户端同时优化。在方案二的基础上，进一步缩短甚至取消 execd 服务端的 graceful shutdown 时间，同时让 SDK 在收到终态 SSE 事件后立即返回。这样既减少服务端无效等待，也避免客户端阻塞，可以最大程度降低短命令的端到端时延。该方案优化效果最好，但同时涉及 execd 和 SDK 两侧逻辑，改动范围和测试成本最高，需要重点验证 SSE 完整性、连接关闭行为、代理或 sidecar 状态同步以及高并发情况下的稳定性，因此更适合作为前两种方案验证后的最终优化方案。
+
+
+# OpenSandbox 文件与命令执行机制交接文档
+
+## 一、整体架构
+
+OpenSandbox 在 Claude Code 场景下，可以把调用链理解成两段。
+
+第一段是 Claude Code 与 MCP Server 之间的通信：
+
+```text
+Claude Code
+↓
+MCP Tool Call
+↓
+JSON-RPC
+↓
+stdio / Streamable HTTP
+↓
+OpenSandbox MCP Server
+```
+
+Claude Code 根据模型生成的 Tool Call，选择 MCP Server 已经暴露的 Tool，例如 `file_read`、`file_write`、`command_run` 等。Tool 名称和参数会按照 MCP 协议封装成 JSON-RPC 消息，再通过 stdio 或 Streamable HTTP 发送给 MCP Server。stdio 主要适用于 Claude Code 本地启动 MCP Server 子进程的场景，双方通过 stdin/stdout 通信；Streamable HTTP 更适合 MCP Server 独立部署或远程部署的场景。
+
+第二段是 MCP Server 与远端 Sandbox 之间的通信：
+
+```text
+MCP Server
+↓
+OpenSandbox Python SDK
+↓
+HTTP Request
+↓
+远端 Sandbox 内 execd
+↓
+实际文件系统 / 命令执行
+```
+
+MCP Server 本身并不直接操作远端文件系统，也不直接启动远端 Shell，而是通过 OpenSandbox Python SDK 将 Tool 调用转换成 execd 能够处理的 HTTP API 请求。远端 Sandbox 内部常驻 execd 服务，真正的文件读写、命令执行等操作都由 execd 完成。
+
+因此整个系统中几个关键角色可以简单理解为：
+
+```text
+MCP Tool
+= 给 Agent 使用的能力接口
+
+MCP Server
+= 接收 Tool Call、校验参数、路由 Tool、调用 SDK 的服务进程
+
+OpenSandbox SDK
+= MCP Server 调用 OpenSandbox 后端的客户端封装
+
+Sandbox Object
+= MCP Server 本地保存的远端 Sandbox 代理对象
+
+execd
+= 运行在远端 Sandbox 中，真正执行文件和命令操作的服务
+```
+
+---
+
+# 二、file_read 文件读取完整流程
+
+## 1. MCP 请求传输
+
+Claude Code 根据模型生成的 Tool Call，将要调用的 Tool 名称及其参数，例如 `file_read`、`sandbox_id`、`path`、`connect_if_missing` 等，按照 MCP 规定封装成 JSON-RPC 消息，并通过 MCP transport 发送给 OpenSandbox MCP Server。
+
+OpenSandbox 当前主要支持 stdio 和 Streamable HTTP 两种 transport。stdio 更适合 Claude Code 直接启动本地 MCP Server 子进程的场景，此时 Claude Code 向 MCP Server 的 stdin 写入请求，MCP Server 通过 stdout 返回结果。Streamable HTTP 更适合 MCP Server 独立部署或远程部署的场景，通过 HTTP 在网络上传输 MCP JSON-RPC 消息。
+
+transport 的选择取决于 Claude Code 与 MCP Server 的部署和连接方式，与具体 Sandbox 类型无关。
+
+---
+
+## 2. MCP 请求解析
+
+MCP Server 接收到 JSON-RPC 消息后，首先进行 JSON 解码和 JSON-RPC 协议校验，然后识别请求中的 MCP 方法，例如 `tools/call`。
+
+对于 Tool 调用，`params.name` 用于定位具体 Tool，例如 `file_read`；随后根据该 Tool 的参数 Schema 对 `params.arguments` 进行字段、类型和约束校验，并将合法参数转换为 Python 层可以直接使用的参数，最后进入对应的 Tool handler。
+
+需要注意，JSON 格式合法并不代表 Tool 参数一定合法，MCP Server 还需要做 Tool Schema 层的参数校验。
+
+---
+
+## 3. Sandbox 对象获取
+
+MCP Server 根据解析得到的 `sandbox_id`，首先在本地 Sandbox Registry 中查找对应的 `Sandbox` 对象。
+
+如果本地已经登记，则直接复用该对象。
+
+如果本地不存在，并且：
+
+```text
+connect_if_missing = false
+```
+
+则直接返回错误。
+
+如果：
+
+```text
+connect_if_missing = true
+```
+
+则 MCP Server 会使用同一个 `sandbox_id` 尝试连接 OpenSandbox 后端已经存在的 Sandbox 实例。
+
+如果后端存在对应 Sandbox，则在 MCP Server 本地创建并注册对应的 `Sandbox` 对象；如果后端也不存在该 `sandbox_id`，则返回错误。
+
+这里不会自动创建新的 Sandbox。
+
+`Sandbox` 对象本身只是远端 Sandbox 的本地代理对象，其中保存或封装了 `sandbox_id`、endpoint、client、连接信息等。真正的文件操作仍然发生在远端 Sandbox 中。
+
+---
+
+## 4. SDK 文件读取调用
+
+MCP Server 将面向 Agent 的 Tool 调用映射为 OpenSandbox Python SDK 方法调用。
+
+例如：
+
+```text
+file_read(
+  sandbox_id="abc",
+  path="/workspace/a.py"
+)
+```
+
+经过 Sandbox 对象定位后，可以转换成类似：
+
+```python
+sandbox.files.read_file("/workspace/a.py")
+```
+
+这里 `sandbox_id` 已经在前一步被转换成对应的 `Sandbox` 对象，因此 SDK 方法通常只需要处理 `path`、encoding、读取范围等业务参数。
+
+这一层的核心作用是：
+
+```text
+Agent Tool 语义
+↓
+转换
+↓
+程序可执行的 SDK 调用
+```
+
+---
+
+## 5. execd HTTP 请求构造
+
+OpenSandbox SDK 根据 `Sandbox` 对象中保存的远端连接信息，以及文件读取参数，构造发往 execd 的 HTTP 请求。
+
+对于 `file_read`，通常对应类似：
+
+```text
+GET /files/download?path=/workspace/a.py
+```
+
+根据具体实现，还可能携带 Range、offset、limit、encoding 等参数。
+
+这一步主要负责确定：
+
+```text
+目标 endpoint
+HTTP Method
+URL
+Query
+Header
+Request Body
+```
+
+本地 `Sandbox` 对象本身不会执行文件读取，它只是 SDK 用来找到目标远端 Sandbox 的代理对象。
+
+---
+
+## 6. HTTP 请求发送与 execd 路由
+
+SDK 将已经构造好的 HTTP 请求发送到目标 Sandbox 内部的 execd 服务。
+
+execd 收到请求后，根据：
+
+```text
+HTTP Method
++
+URL Path
+```
+
+匹配到对应的文件接口 handler，然后解析 Query、Header 或 Request Body 中的参数，进入具体文件操作逻辑。
+
+例如：
+
+```text
+GET /files/download
+↓
+Filesystem Handler
+```
+
+---
+
+## 7. Sandbox 文件访问
+
+execd 根据文件路径和读取参数，在 Sandbox 文件系统中定位目标文件。
+
+随后会完成必要的路径、存在性、访问权限等检查，检查通过后打开目标文件并进入实际读取过程。
+
+真正访问文件系统的是远端 Sandbox 中的 execd，而不是 MCP Server，也不是 MCP Server 本地的 `Sandbox` 对象。
+
+---
+
+## 8. 文件内容 HTTP 返回
+
+execd 根据请求参数读取文件内容，例如完整读取或者按照 Range、offset、limit 读取。
+
+读取结果被写入 HTTP Response Body，并通过 HTTP 返回给 OpenSandbox SDK。
+
+这一阶段可以概括为：
+
+```text
+Sandbox 文件
+↓
+execd 读取
+↓
+HTTP Response Body
+↓
+SDK
+```
+
+---
+
+## 9. SDK 内容解析和解码
+
+OpenSandbox SDK 收到 execd 返回的 HTTP Response 后，会先检查 HTTP 状态码和响应信息，再读取 Response Body。
+
+对于文本文件，SDK 会按照指定 encoding 对字节数据进行解码，最终转换成 Python 层可直接使用的数据，例如：
+
+```python
+str
+```
+
+所以这一层完成的是：
+
+```text
+HTTP Response
+↓
+bytes
+↓
+decode
+↓
+Python data
+```
+
+---
+
+## 10. MCP Tool Result 构造
+
+MCP Tool handler 接收 SDK 返回的 Python 数据，再根据 `file_read` Tool 定义的返回结构，将结果封装成 MCP Tool Result。
+
+这一步由 MCP Server / Tool handler 完成，而不是 OpenSandbox SDK 完成。
+
+可以理解为：
+
+```text
+SDK
+HTTP Response → Python data
+
+MCP Server
+Python data → MCP Tool Result
+```
+
+---
+
+## 11. MCP 结果返回
+
+MCP Server 将 MCP Tool Result 封装并序列化成 JSON-RPC Response，再通过当前 MCP transport 返回给 Claude Code。
+
+stdio 模式下：
+
+```text
+MCP Server stdout
+↓
+Claude Code
+```
+
+Streamable HTTP 模式下：
+
+```text
+HTTP Response
+↓
+Claude Code MCP Client
+```
+
+Claude Code 接收到结果后进行解析，并将 Tool Result 放入 Agent Context，供模型继续推理。
+
+---
+
+## file_read 总链路
+
+```text
+Claude Code
+↓
+MCP file_read Tool Call
+↓
+JSON-RPC
+↓
+stdio / Streamable HTTP
+↓
+OpenSandbox MCP Server
+↓
+JSON-RPC解析
+↓
+Tool路由 + 参数校验
+↓
+sandbox_id
+↓
+Sandbox Registry / 后端连接
+↓
+本地 Sandbox 对象
+↓
+MCP Tool Handler
+↓
+OpenSandbox Python SDK
+↓
+GET /files/download
+↓
+远端 Sandbox / execd
+↓
+Filesystem Handler
+↓
+读取文件
+↓
+HTTP Response
+↓
+SDK解析 + 解码
+↓
+Python数据
+↓
+MCP Tool Result
+↓
+JSON-RPC Response
+↓
+Claude Code
+```
+
+---
+
+# 三、command_run / Bash 命令执行完整流程
+
+`command_run` 前面的 MCP 处理流程与 `file_read` 基本相同，主要区别出现在 SDK 进入 execd 之后。
+
+---
+
+## 1. MCP 请求传输
+
+Claude Code 根据模型生成的 Tool Call，将 `command_run`、`sandbox_id`、`command`、`cwd`、`timeout`、`background` 等参数封装成 MCP JSON-RPC 请求，并通过 stdio 或 Streamable HTTP 发送给 OpenSandbox MCP Server。
+
+---
+
+## 2. MCP 请求解析
+
+MCP Server 对 JSON-RPC 消息进行解码、协议校验、Tool 路由和参数 Schema 校验。
+
+例如：
+
+```text
+params.name = command_run
+```
+
+会被路由到对应的 command Tool handler。
+
+---
+
+## 3. Sandbox 对象获取
+
+根据 `sandbox_id` 查找 MCP Server 本地 Sandbox Registry。
+
+如果本地存在，则复用；如果不存在，则根据 `connect_if_missing` 决定是否尝试连接后端已经存在的 Sandbox。
+
+这一部分与 `file_read` 相同。
+
+---
+
+## 4. SDK 命令执行调用
+
+MCP Server 将 Agent 面向的 `command_run` Tool 调用转换成 OpenSandbox Python SDK 的命令执行接口，例如：
+
+```python
+sandbox.commands.run(command, ...)
+```
+
+SDK 参数中可能包含：
+
+```text
+command
+cwd
+timeout
+background
+envs
+uid
+gid
+```
+
+这一层仍然是 Tool 到 SDK 的语义转换。
+
+---
+
+## 5. execd HTTP 请求构造
+
+OpenSandbox SDK 将命令执行参数转换成 execd HTTP 请求。
+
+普通命令执行通常对应：
+
+```text
+POST /command
+```
+
+Request Body 中包含命令字符串和相关执行参数。
+
+与 `file_read` 最大的区别是：
+
+```text
+file_read
+→ Filesystem API
+
+command_run
+→ Command API
+```
+
+---
+
+## 6. HTTP 请求发送与 execd 路由
+
+SDK 将 `POST /command` 请求发送给远端 Sandbox 内 execd。
+
+execd 根据 URL 和 Method 匹配 Command Handler，并解析命令内容、工作目录、环境变量、超时、前后台执行方式等参数。
+
+---
+
+## 7. Sandbox 内启动命令
+
+execd 根据解析后的参数，在 Sandbox 内启动对应的 Shell 或子进程执行命令。
+
+例如：
+
+```bash
+grep ERROR /workspace/app.log
+```
+
+流程可以理解成：
+
+```text
+execd Command Handler
+↓
+启动 Shell / Process
+↓
+执行 grep
+↓
+Linux 文件系统
+```
+
+因此 Bash 命令相比原生文件 API 多了一层：
+
+```text
+进程创建
++
+Shell解析
++
+命令执行
+```
+
+---
+
+## 8. SSE 流式返回命令输出
+
+命令运行过程中可能持续产生：
+
+```text
+stdout
+stderr
+execution status
+execution_complete
+execution_error
+```
+
+因此 OpenSandbox 的 `POST /command` 使用 SSE，也就是 Server-Sent Events，将命令执行事件以流式方式返回给 SDK。
+
+整体过程：
+
+```text
+Command Process
+↓
+stdout / stderr / status
+↓
+execd
+↓
+SSE Events
+↓
+OpenSandbox SDK
+```
+
+SSE 的主要作用不是让命令执行更快，而是让长命令可以边执行边返回输出，同时避免等待所有内容结束后一次性返回。
+
+---
+
+## 9. SDK 解析 SSE
+
+OpenSandbox SDK 持续消费 SSE event，并将 event 转换成 Python 层的执行结果。
+
+SDK 会通过 event dispatcher 逐步处理 stdout、stderr、execution_complete、error 等事件，并最终整理成类似：
+
+```text
+Execution
+stdout
+stderr
+exit_code
+status
+```
+
+的 Python 对象。
+
+---
+
+## 10. MCP Tool Result 构造
+
+MCP Tool handler 接收 SDK 返回的命令执行结果，并按照 `command_run` Tool 的响应结构封装成 MCP Tool Result。
+
+例如可能包含：
+
+```text
+stdout
+stderr
+exit code
+execution status
+```
+
+---
+
+## 11. MCP 结果返回
+
+MCP Server 将 MCP Tool Result 封装成 JSON-RPC Response，通过 stdio 或 Streamable HTTP 返回 Claude Code。
+
+Claude Code 将命令结果写入 Agent Context，模型再决定下一步操作。
+
+---
+
+## command_run 总链路
+
+```text
+Claude Code
+↓
+MCP command_run Tool Call
+↓
+JSON-RPC
+↓
+stdio / Streamable HTTP
+↓
+OpenSandbox MCP Server
+↓
+JSON-RPC解析 + Tool路由 + 参数校验
+↓
+sandbox_id
+↓
+Sandbox对象
+↓
+MCP Tool Handler
+↓
+sandbox.commands.run(...)
+↓
+OpenSandbox Python SDK
+↓
+POST /command
+↓
+远端 Sandbox / execd
+↓
+Command Handler
+↓
+启动 Shell / 子进程
+↓
+执行 Bash 命令
+↓
+stdout / stderr / execution events
+↓
+SSE
+↓
+OpenSandbox SDK
+↓
+Python Execution Result
+↓
+MCP Tool Result
+↓
+JSON-RPC Response
+↓
+Claude Code
+```
+
+---
+
+# 四、file_read 与 command_run 的核心区别
+
+两条链路在前半部分基本一致：
+
+```text
+Claude Code
+↓
+MCP
+↓
+MCP Server
+↓
+Sandbox Object
+↓
+SDK
+```
+
+真正的区别出现在 SDK 调用 execd 之后。
+
+`file_read`：
+
+```text
+SDK
+↓
+GET /files/download
+↓
+execd Filesystem Handler
+↓
+直接访问文件系统
+↓
+HTTP Response
+```
+
+`command_run`：
+
+```text
+SDK
+↓
+POST /command
+↓
+execd Command Handler
+↓
+启动 Shell / Process
+↓
+执行具体命令
+↓
+stdout / stderr
+↓
+SSE
+```
+
+因此对于固定文件操作，例如读取、写入、删除、移动、搜索路径等，直接使用 Filesystem API 通常比绕到 Bash 更直接。
+
+例如读取文件：
+
+```text
+file_read
+→ execd直接读文件
+```
+
+而：
+
+```bash
+cat a.txt
+```
+
+需要：
+
+```text
+execd
+↓
+启动 Shell
+↓
+启动 cat
+↓
+cat 再读取文件
+↓
+stdout
+↓
+SSE
+```
+
+因此 command 路径通常会额外产生 Shell/子进程创建、stdout/stderr 捕获、SSE event 处理等开销。
+
+---
+
+# 五、command_run 中 SSE 的 1 秒尾延迟问题
+
+OpenSandbox 当前 `POST /command` 在命令执行完成并发送 final SSE event 后，还会执行一段 graceful shutdown 等待。
+
+当前默认配置大约为：
+
+```text
+1 second
+```
+
+流程类似：
+
+```text
+命令完成
+↓
+execution_complete
+↓
+final event flush
+↓
+sleep 1s
+↓
+关闭 SSE connection
+```
+
+这 1 秒的主要目的，是给 SSE buffered events 和部分 downstream component 留出状态同步时间。
+
+对于长命令，这 1 秒相对影响不明显。
+
+但对于：
+
+```bash
+pwd
+echo hello
+true
+ls
+```
+
+这类只有几毫秒或几十毫秒的短命令，固定 1 秒可能成为非常明显的尾延迟。
+
+---
+
+# 六、1 秒尾延迟的三个优化方案
+
+## 方案一：缩短服务端 graceful shutdown 时间
+
+最简单的优化方式是保留现有执行逻辑，只将默认约 1 秒的 graceful shutdown 时间改短，例如改成 100ms、50ms 或更低。
+
+该方案通常可以通过配置实现，不需要修改 MCP Server 或 SDK，执行难度最低，适合作为第一阶段性能实验。
+
+风险主要在于等待时间过短可能导致 SSE event 消费不完整、连接关闭过早或者部分下游状态同步异常，因此不建议一开始直接设成 0，需要逐级测试。
+
+---
+
+## 方案二：客户端收到完成事件后提前返回
+
+该方案保留 execd 服务端原有的 1 秒 graceful shutdown，但修改 SDK 的 SSE 消费逻辑。
+
+当前前台命令通常会继续等待 SSE stream 真正结束，因此服务端 sleep 的 1 秒会进入 SDK 的端到端延迟。
+
+可以改成：
+
+```text
+收到 execution_complete
+↓
+确认最终结果已经完整
+↓
+SDK立即返回
+```
+
+此时 execd 服务端仍然可以继续完成自己的 1 秒 graceful shutdown，但 MCP Server 和 Claude Code 已经可以继续后续工作。
+
+因此这种方案的核心不是“删除 1 秒”，而是：
+
+```text
+把 1 秒移出客户端关键路径
+```
+
+该方案需要修改 SDK，执行难度中等，但相比直接删除服务端等待，风险更低，性能收益也比较明显，因此是目前最值得优先验证的优化方案。
+
+---
+
+## 方案三：服务端与客户端同时优化
+
+最终可以同时优化两侧。
+
+服务端将 1 秒 graceful shutdown 缩短甚至取消，同时 SDK 在收到 `execution_complete` 后立即返回。
+
+最终流程可以从：
+
+```text
+命令执行
+↓
+complete
+↓
+等待1秒
+↓
+SDK返回
+```
+
+优化为：
+
+```text
+命令执行
+↓
+complete
+↓
+SDK立即返回
+```
+
+同时服务端仅进行极短时间或异步的 cleanup。
+
+这种方式能够最大程度减少短命令的端到端时延，但同时修改 execd 和 SDK 两侧逻辑，执行难度和测试成本最高，需要重点验证 SSE 完整性、连接生命周期、sidecar/proxy 状态同步以及高并发情况下的稳定性，因此更适合作为前两个方案验证完成后的最终优化方案。
+
+---
+
+# 七、建议的实验顺序
+
+建议不要直接修改大量代码，而是逐层确认性能瓶颈。
+
+第一步保持代码不变，只测：
+
+```text
+pwd
+echo hello
+true
+ls /tmp
+```
+
+记录：
+
+```text
+T0 = SDK发请求
+T1 = 命令开始
+T2 = 第一个SSE event
+T3 = execution_complete
+T4 = SDK run()返回
+```
+
+重点关注：
+
+```text
+T4 - T3
+```
+
+如果接近 1 秒，说明 graceful shutdown 的固定等待确实进入了客户端关键路径。
+
+第二步只修改：
+
+```text
+EXECD_API_GRACE_SHUTDOWN
+```
+
+例如：
+
+```text
+1s
+500ms
+100ms
+50ms
+```
+
+观察总时延是否同步下降。
+
+第三步再修改 SDK：
+
+```text
+execution_complete
+→ early return
+```
+
+如果此时：
+
+```text
+T4 ≈ T3
+```
+
+说明 1 秒已经成功从关键路径中移除。
+
+最后再考虑是否需要进一步把 execd 侧的 grace time 缩短或取消。
+
+---
+
+# 八、后续优化方向
+
+当前比较值得继续研究的方向主要有以下几个。
+
+第一，固定文件操作尽量使用 Filesystem API，而不是 Bash。例如：
+
+```text
+cat
+→ file_read
+
+rm
+→ file_delete
+
+find路径
+→ file_search
+```
+
+这样可以避免 Shell 和子进程启动开销。
+
+第二，对于 OpenSandbox 当前没有提供专用 Tool 的高频操作，可以考虑新增：
+
+```text
+MCP Tool
+↓
+SDK Method
+↓
+execd Filesystem API
+```
+
+例如内容搜索：
+
+```text
+file_search_content
+```
+
+从而避免大量使用：
+
+```bash
+grep
+```
+
+第三，对 command 路径继续研究：
+
+```text
+短命令
+→ non-streaming / fast path
+
+长命令
+→ SSE
+```
+
+即根据命令类型选择不同返回机制。
+
+第四，对 Bash session 做实验，比较：
+
+```text
+每次重新启动 Shell
+```
+
+和：
+
+```text
+复用已有 Bash Session
+```
+
+的时延差异。
+
+---
+
+# 九、一句话总结整个机制
+
+OpenSandbox 的文件操作和 Bash 命令执行在前半段都经过：
+
+```text
+Claude Code
+→ MCP
+→ MCP Server
+→ Sandbox Object
+→ SDK
+```
+
+之后分成两条路径：
+
+```text
+文件操作
+→ execd Filesystem API
+→ 直接操作文件系统
+```
+
+和：
+
+```text
+命令操作
+→ execd Command API
+→ 启动Shell/子进程
+→ SSE返回执行事件
+```
+
+因此固定、结构化、高频的文件操作更适合走 Filesystem API，而 Bash 更适合复杂、动态和组合型操作。
+
+当前短命令性能优化最值得关注的点，是 `POST /command` final SSE event 之后约 1 秒的 graceful shutdown 尾延迟。最推荐优先验证的方案，是让 SDK 在收到 `execution_complete` 后立即返回，从而将这 1 秒从客户端关键路径中移除。
