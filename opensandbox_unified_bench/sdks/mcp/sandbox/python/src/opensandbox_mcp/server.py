@@ -44,6 +44,12 @@ from opensandbox.models.sandboxes import (
 )
 from pydantic import BaseModel, Field
 
+from opensandbox_mcp.benchmark import (
+    BenchmarkEvent,
+    BenchmarkOperation,
+    BenchmarkRecorder,
+)
+
 
 @dataclass
 class ServerState:
@@ -92,11 +98,13 @@ def register_tools(
     prefix: str = "",
     state: ServerState | None = None,
     connection_config: ConnectionConfig | None = None,
+    benchmark_recorder: BenchmarkRecorder | None = None,
 ) -> ServerState:
     """Register sandbox tools on a FastMCP instance."""
     config = (connection_config or ConnectionConfig()).with_transport_if_missing()
     state = state or ServerState(connection_config=config)
     name_prefix = f"{prefix}_" if prefix else ""
+    benchmark_recorder = benchmark_recorder or BenchmarkRecorder()
 
     def tool():
         def decorator(func):
@@ -124,6 +132,18 @@ def register_tools(
         )
         await state.add(sandbox)
         return sandbox
+
+    @tool()
+    async def benchmark_drain_events(
+        trace_ids: list[str] | None = None,
+    ) -> list[BenchmarkEvent]:
+        """Return and remove buffered benchmark events.
+
+        Only calls carrying ``benchmark_trace_id`` produce events. Fetch events
+        after a measurement batch so event serialization is outside the timed
+        file operation.
+        """
+        return benchmark_recorder.drain(trace_ids)
 
     @tool()
     async def sandbox_create(
@@ -486,6 +506,7 @@ def register_tools(
         encoding: str = "utf-8",
         range_header: str | None = None,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> FileReadResponse:
         """Read a text file from the sandbox.
 
@@ -500,14 +521,19 @@ def register_tools(
             {"path": "...", "content": "..."}.
 
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        content = await sandbox.files.read_file(
-            path, encoding=encoding, range_header=range_header
-        )
-        return FileReadResponse(path=path, content=content)
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_read"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            content = await benchmark.sdk_call(
+                lambda: sandbox.files.read_file(
+                    path, encoding=encoding, range_header=range_header
+                )
+            )
+            return FileReadResponse(path=path, content=content)
 
     @tool()
     async def file_write(
@@ -520,6 +546,7 @@ def register_tools(
         owner: str | None = None,
         group: str | None = None,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Write a text file inside the sandbox.
 
@@ -536,19 +563,24 @@ def register_tools(
         Returns:
             {"status": "written"} when successful.
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        await sandbox.files.write_file(
-            path,
-            content,
-            encoding=encoding,
-            mode=mode,
-            owner=owner,
-            group=group,
-        )
-        return StatusResponse(status="written")
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_write"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            await benchmark.sdk_call(
+                lambda: sandbox.files.write_file(
+                    path,
+                    content,
+                    encoding=encoding,
+                    mode=mode,
+                    owner=owner,
+                    group=group,
+                )
+            )
+            return StatusResponse(status="written")
 
     @tool()
     async def file_delete(
@@ -556,6 +588,7 @@ def register_tools(
         paths: list[str],
         *,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Delete files inside the sandbox.
 
@@ -567,12 +600,15 @@ def register_tools(
         Returns:
             {"status": "deleted"} when successful.
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        await sandbox.files.delete_files(paths)
-        return StatusResponse(status="deleted")
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_delete"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            await benchmark.sdk_call(lambda: sandbox.files.delete_files(paths))
+            return StatusResponse(status="deleted")
 
     @tool()
     async def file_search(
@@ -581,6 +617,7 @@ def register_tools(
         pattern: str,
         *,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> list[EntryInfo]:
         """Search for files matching a pattern.
 
@@ -593,12 +630,16 @@ def register_tools(
         Returns:
             List of entry info objects.
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        results = await sandbox.files.search(SearchEntry(path=path, pattern=pattern))
-        return results
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_search"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            return await benchmark.sdk_call(
+                lambda: sandbox.files.search(SearchEntry(path=path, pattern=pattern))
+            )
 
     @tool()
     async def file_create_directories(
@@ -606,6 +647,7 @@ def register_tools(
         entries: list[DirectoryEntryInput],
         *,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Create directories inside the sandbox.
 
@@ -617,15 +659,20 @@ def register_tools(
         Returns:
             {"status": "created"} when successful.
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        write_entries = [
-            WriteEntry(**entry.model_dump(exclude_none=True)) for entry in entries
-        ]
-        await sandbox.files.create_directories(write_entries)
-        return StatusResponse(status="created")
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_create_directories"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            write_entries = [
+                WriteEntry(**entry.model_dump(exclude_none=True)) for entry in entries
+            ]
+            await benchmark.sdk_call(
+                lambda: sandbox.files.create_directories(write_entries)
+            )
+            return StatusResponse(status="created")
 
     @tool()
     async def file_delete_directories(
@@ -633,6 +680,7 @@ def register_tools(
         paths: list[str],
         *,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Delete directories inside the sandbox.
 
@@ -644,12 +692,15 @@ def register_tools(
         Returns:
             {"status": "deleted"} when successful.
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        await sandbox.files.delete_directories(paths)
-        return StatusResponse(status="deleted")
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_delete_directories"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            await benchmark.sdk_call(lambda: sandbox.files.delete_directories(paths))
+            return StatusResponse(status="deleted")
 
     @tool()
     async def file_move(
@@ -657,6 +708,7 @@ def register_tools(
         entries: list[MoveEntry],
         *,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Move or rename files/directories inside the sandbox.
 
@@ -668,12 +720,15 @@ def register_tools(
         Returns:
             {"status": "moved"} when successful.
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        await sandbox.files.move_files(entries)
-        return StatusResponse(status="moved")
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_move"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            await benchmark.sdk_call(lambda: sandbox.files.move_files(entries))
+            return StatusResponse(status="moved")
 
     @tool()
     async def file_replace_contents(
@@ -681,6 +736,7 @@ def register_tools(
         entries: list[ContentReplaceEntry],
         *,
         connect_if_missing: bool = False,
+        benchmark_trace_id: str | None = None,
     ) -> list[ContentReplaceResult]:
         """Replace content inside files.
 
@@ -692,15 +748,20 @@ def register_tools(
         Returns:
             List of replacement results with counts per file.
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        replace_entries = [
-            ContentReplaceEntry(**entry.model_dump(exclude_none=True))
-            for entry in entries
-        ]
-        return await sandbox.files.replace_contents_detailed(replace_entries)
+        async with BenchmarkOperation(
+            benchmark_recorder, benchmark_trace_id, "file_replace_contents"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            replace_entries = [
+                ContentReplaceEntry(**entry.model_dump(exclude_none=True))
+                for entry in entries
+            ]
+            return await benchmark.sdk_call(
+                lambda: sandbox.files.replace_contents_detailed(replace_entries)
+            )
 
     @tool()
     async def sandbox_get_endpoint(

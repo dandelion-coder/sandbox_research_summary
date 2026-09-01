@@ -1,0 +1,56 @@
+{
+  "cases": [
+    {
+      "name": "read_text",
+      "setup": [
+        {
+          "tool": "file_write",
+          "arguments": {
+            "sandbox_id": "{sandbox_id}",
+            "path": "/tmp/opensandbox-benchmark-read-{iteration}.txt",
+            "content": "benchmark content",
+            "connect_if_missing": true
+          }
+        }
+      ],
+      "call": {
+        "tool": "file_read",
+        "arguments": {
+          "sandbox_id": "{sandbox_id}",
+          "path": "/tmp/opensandbox-benchmark-read-{iteration}.txt",
+          "connect_if_missing": true
+        }
+      },
+      "teardown": [
+        {
+          "tool": "file_delete",
+          "arguments": {
+            "sandbox_id": "{sandbox_id}",
+            "paths": ["/tmp/opensandbox-benchmark-read-{iteration}.txt"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "write_text",
+      "call": {
+        "tool": "file_write",
+        "arguments": {
+          "sandbox_id": "{sandbox_id}",
+          "path": "/tmp/opensandbox-benchmark-write-{trace_id}.txt",
+          "content": "benchmark content",
+          "connect_if_missing": true
+        }
+      },
+      "teardown": [
+        {
+          "tool": "file_delete",
+          "arguments": {
+            "sandbox_id": "{sandbox_id}",
+            "paths": ["/tmp/opensandbox-benchmark-write-{trace_id}.txt"]
+          }
+        }
+      ]
+    }
+  ]
+}

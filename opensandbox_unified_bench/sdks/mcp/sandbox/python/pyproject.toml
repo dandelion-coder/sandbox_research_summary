@@ -59,6 +59,7 @@ Issues = "https://github.com/opensandbox-group/OpenSandbox/issues"
 
 [project.scripts]
 opensandbox-mcp = "opensandbox_mcp.__main__:main"
+opensandbox-mcp-benchmark = "opensandbox_mcp.benchmark_client:main"
 
 [tool.hatch.version]
 source = "vcs"

@@ -149,5 +149,43 @@ Here are some examples of what you can ask an LLM to do:
 - "Generate a CSV file with fake sales data and run a simple summary script."
 - "Start a tiny web server on port 8000 and return the public URL."
 - "Build a minimal REST API (hello + health) and expose it on port 8000."
+
+## 7. File Tool Benchmark
+
+The package includes an opt-in, common-stage benchmark for all filesystem
+tools. Normal tool calls are not recorded. A measured call supplies a unique
+`benchmark_trace_id` and produces this server-side timeline:
+
+```text
+M0 -> B0 -> OpenSandbox SDK call -> B1 -> M4
+```
+
+The benchmark client adds `C0` and `C1`, drains server events after the batch,
+and writes ordered raw events plus per-invocation and aggregate CSV reports.
+The OpenSandbox Python SDK and execd require no benchmark modifications.
+
+Start with a copy of `benchmark-cases.example.json`, then run:
+
+```bash
+uv run opensandbox-mcp-benchmark \
+  --cases benchmark-cases.example.json \
+  --sandbox-id <sandbox-id> \
+  --server-command uv \
+  --server-arg run \
+  --server-arg opensandbox-mcp \
+  --iterations 20 \
+  --output benchmark-results
+```
+
+Each case can define untimed `setup` and `teardown` actions around one measured
+`call`. Strings in action arguments may use `{sandbox_id}`, `{case}`,
+`{iteration}`, and `{trace_id}`. The output directory contains:
+
+- `events.jsonl`: C0/M0/B0/B1/M4/C1 events ordered by wall-clock timestamp.
+- `measurements.csv`: one row per invocation with every stage duration.
+- `summary.csv`: p50 and p95 grouped by case and tool.
+
+Client and server monotonic clocks are intentionally not subtracted from each
+other. Transport/MCP overhead is calculated as `(C1-C0) - (M4-M0)`.
 - "Create a tar.gz of /app and report the file size."
 - "Build a simple Snake game and return the web endpoint where it can be accessed."
