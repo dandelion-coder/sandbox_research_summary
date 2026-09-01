@@ -14,10 +14,18 @@
 
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
 from opensandbox_mcp.benchmark import BenchmarkOperation, BenchmarkRecorder
-from opensandbox_mcp.benchmark_client import _percentile, _render, _tool_arguments
+from opensandbox_mcp.benchmark_client import (
+    HttpResponseSizeRecorder,
+    _percentile,
+    _render,
+    _tool_arguments,
+)
 from opensandbox_mcp.server import create_server
 
 
@@ -122,3 +130,18 @@ async def test_benchmark_context_does_not_change_tool_input_schemas() -> None:
         properties = tools[name].inputSchema.get("properties", {})
         assert "ctx" not in properties
         assert "benchmark_trace_id" not in properties
+
+
+@pytest.mark.asyncio
+async def test_http_response_size_uses_complete_response_body_bytes() -> None:
+    recorder = HttpResponseSizeRecorder()
+    request = httpx.Request(
+        "POST",
+        "http://127.0.0.1:8000/mcp",
+        content=json.dumps({"jsonrpc": "2.0", "id": 201, "method": "tools/call"}),
+    )
+    response = httpx.Response(200, content=b"complete-response-body", request=request)
+
+    await recorder.on_response(response)
+
+    assert recorder.response_bytes_by_trace == {"201": 22}

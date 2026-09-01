@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -84,6 +85,8 @@ class BenchmarkClientSession(ClientSession):
         super().__init__(*args, **kwargs)
         self.client_events: list[dict[str, Any]] = []
         self.invocation_meta: dict[str, dict[str, Any]] = {}
+        self.response_bytes_by_trace: dict[str, int] = {}
+        self.response_bytes_semantics = "unavailable_for_stdio"
         self._armed_measurement: dict[str, Any] | None = None
 
     def arm_measurement(self, meta: dict[str, Any]) -> str:
@@ -111,7 +114,6 @@ class BenchmarkClientSession(ClientSession):
                 metadata,
                 progress_callback,
             )
-
         self._armed_measurement = None
         trace_id = measurement["trace_id"]
         tool = measurement["tool"]
@@ -152,6 +154,26 @@ class BenchmarkClientSession(ClientSession):
                     "error_type": type(error).__name__ if error else None,
                 }
             )
+
+
+class HttpResponseSizeRecorder:
+    """Record decoded HTTP response-body bytes by JSON-RPC request id."""
+
+    def __init__(self) -> None:
+        self.response_bytes_by_trace: dict[str, int] = {}
+
+    async def on_response(self, response: httpx.Response) -> None:
+        if response.request.method != "POST":
+            return
+        try:
+            request_payload = json.loads(response.request.content)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            return
+        request_id = request_payload.get("id")
+        if request_id is None:
+            return
+        await response.aread()
+        self.response_bytes_by_trace[str(request_id)] = len(response.content)
 
 
 async def _wait_for_server(url: str, process: asyncio.subprocess.Process) -> None:
@@ -207,10 +229,25 @@ async def _open_session(args: argparse.Namespace):
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await _wait_for_server(args.mcp_url, process)
-        async with streamable_http_client(args.mcp_url) as transport:
-            read_stream, write_stream, _ = transport
-            async with BenchmarkClientSession(read_stream, write_stream) as session:
-                yield session
+        response_sizes = HttpResponseSizeRecorder()
+        timeout = httpx.Timeout(30, read=300)
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            event_hooks={"response": [response_sizes.on_response]},
+        ) as http_client:
+            async with streamable_http_client(
+                args.mcp_url, http_client=http_client
+            ) as transport:
+                read_stream, write_stream, _ = transport
+                async with BenchmarkClientSession(read_stream, write_stream) as session:
+                    session.response_bytes_by_trace = (
+                        response_sizes.response_bytes_by_trace
+                    )
+                    session.response_bytes_semantics = (
+                        "httpx_decoded_http_response_body"
+                    )
+                    yield session
     finally:
         if process is not None and process.returncode is None:
             process.terminate()
@@ -344,6 +381,8 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         server_events = _server_events(drain_result)
         client_events = session.client_events
         invocation_meta = session.invocation_meta
+        response_bytes_by_trace = dict(session.response_bytes_by_trace)
+        response_bytes_semantics = session.response_bytes_semantics
 
     for event in server_events:
         event["process"] = "mcp_server"
@@ -400,6 +439,8 @@ async def run_benchmark(args: argparse.Namespace) -> None:
                 "stage3_ms": stage3 / 1_000_000,
                 "stage4_ms": stage4 / 1_000_000,
                 "e2e_ms": e2e / 1_000_000,
+                "response_bytes": response_bytes_by_trace.get(trace_id),
+                "response_bytes_semantics": response_bytes_semantics,
                 "result_build_ms": result_build / 1_000_000,
                 "response_return_ms": response_return / 1_000_000,
                 "client_e2e_monotonic_ms": client_e2e_mono / 1_000_000,
@@ -444,11 +485,25 @@ async def run_benchmark(args: argparse.Namespace) -> None:
             "case": case_name,
             "tool": tool,
             "samples": len(rows),
+            "response_bytes_semantics": rows[0]["response_bytes_semantics"],
         }
         for metric in metric_names:
             values = [float(row[metric]) for row in rows]
             summary[f"{metric}_p50"] = statistics.median(values)
             summary[f"{metric}_p95"] = _percentile(values, 0.95)
+        response_sizes = [
+            int(row["response_bytes"])
+            for row in rows
+            if row["response_bytes"] is not None
+        ]
+        summary["response_bytes_mean"] = (
+            statistics.mean(response_sizes) if response_sizes else None
+        )
+        summary["response_bytes_min"] = min(response_sizes) if response_sizes else None
+        summary["response_bytes_max"] = max(response_sizes) if response_sizes else None
+        summary["response_bytes_p50"] = (
+            statistics.median(response_sizes) if response_sizes else None
+        )
         summaries.append(summary)
 
     summary_path = output_dir / "summary.csv"

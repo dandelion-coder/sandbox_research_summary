@@ -213,6 +213,20 @@ directory contains:
 - `measurements.csv`: one row per invocation with every stage duration.
 - `summary.csv`: p50 and p95 grouped by case and tool.
 
+For streamable HTTP, `measurements.csv` also contains `response_bytes`. It is
+the length of the complete decoded HTTP response body exposed as
+`httpx.Response.content`, including JSON or SSE body framing but excluding HTTP
+headers and transfer framing. This matches the semantics of
+`len(response.content)`; it is not a count of headers or raw TCP bytes. The
+response hook reads the existing response body and does not issue another
+request. For stdio, the MCP SDK does not expose the original response line, so
+`response_bytes` is blank and `response_bytes_semantics` is
+`unavailable_for_stdio` rather than reporting a reconstructed value.
+
+`summary.csv` reports `response_bytes_mean`, `response_bytes_min`,
+`response_bytes_max`, and `response_bytes_p50` when exact HTTP body sizes are
+available.
+
 The formal metrics use wall-clock timestamps so cross-process stages remain
 defined and sum to E2E:
 
