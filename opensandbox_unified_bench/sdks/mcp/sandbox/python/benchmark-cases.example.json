@@ -2,77 +2,66 @@
   "cases": [
     {
       "name": "file_read_small",
-      "setup": [
-        {
-          "tool": "file_write",
-          "arguments": {
-            "path": "/tmp/opensandbox-benchmark-read-{invocation}.txt",
-            "content": "benchmark content"
-          }
-        }
-      ],
       "call": {
         "tool": "file_read",
         "arguments": {
-          "path": "/tmp/opensandbox-benchmark-read-{invocation}.txt"
+          "path": "/workspace/django/django/utils/text.py"
         }
-      },
-      "teardown": [
-        {
-          "tool": "file_delete",
-          "arguments": {
-            "paths": ["/tmp/opensandbox-benchmark-read-{invocation}.txt"]
-          }
-        }
-      ]
+      }
     },
     {
-      "name": "write_text",
+      "name": "file_read_large",
       "call": {
-        "tool": "file_write",
+        "tool": "file_read",
         "arguments": {
-          "path": "/tmp/opensandbox-benchmark-write-{invocation}.txt",
-          "content": "benchmark content"
+          "path": "/workspace/django/django/db/models/sql/query.py"
         }
-      },
-      "teardown": [
-        {
-          "tool": "file_delete",
-          "arguments": {
-            "paths": ["/tmp/opensandbox-benchmark-write-{invocation}.txt"]
-          }
-        }
-      ]
+      }
     },
     {
-      "name": "file_search_text",
+      "name": "file_search_exact",
+      "call": {
+        "tool": "file_search",
+        "arguments": {
+          "path": "/workspace/django",
+          "pattern": "**/query.py"
+        }
+      }
+    },
+    {
+      "name": "file_search_glob",
+      "call": {
+        "tool": "file_search",
+        "arguments": {
+          "path": "/workspace/django",
+          "pattern": "**/*query*.py"
+        }
+      }
+    },
+    {
+      "name": "file_write",
       "setup": [
         {
           "tool": "command_run",
           "arguments": {
-            "command": "mkdir -p /tmp/opensandbox-benchmark-search-{invocation}"
-          }
-        },
-        {
-          "tool": "file_write",
-          "arguments": {
-            "path": "/tmp/opensandbox-benchmark-search-{invocation}/match.txt",
-            "content": "benchmark content"
+            "command": "mkdir -p /workspace/.opensandbox_benchmark"
           }
         }
       ],
       "call": {
-        "tool": "file_search",
+        "tool": "file_write",
         "arguments": {
-          "path": "/tmp/opensandbox-benchmark-search-{invocation}",
-          "pattern": "*.txt"
+          "path": "/workspace/.opensandbox_benchmark/bench-write-{invocation}.txt",
+          "content": "OPEN_SANDBOX_BENCH_WRITE_PAYLOAD_0123456789"
         }
       },
       "teardown": [
         {
-          "tool": "command_run",
+          "tool": "file_delete",
           "arguments": {
-            "command": "rm -rf /tmp/opensandbox-benchmark-search-{invocation}"
+            "paths": [
+              "/workspace/.opensandbox_benchmark/bench-write-{invocation}.txt"
+            ]
           }
         }
       ]
@@ -81,9 +70,15 @@
       "name": "file_replace_contents",
       "setup": [
         {
+          "tool": "command_run",
+          "arguments": {
+            "command": "mkdir -p /workspace/.opensandbox_benchmark"
+          }
+        },
+        {
           "tool": "file_write",
           "arguments": {
-            "path": "/tmp/opensandbox-benchmark-replace-{invocation}.txt",
+            "path": "/workspace/.opensandbox_benchmark/bench-replace-{invocation}.txt",
             "content": "OPEN_SANDBOX_BENCH_ORIGINAL"
           }
         }
@@ -93,7 +88,7 @@
         "arguments": {
           "entries": [
             {
-              "path": "/tmp/opensandbox-benchmark-replace-{invocation}.txt",
+              "path": "/workspace/.opensandbox_benchmark/bench-replace-{invocation}.txt",
               "old_content": "OPEN_SANDBOX_BENCH_ORIGINAL",
               "new_content": "OPEN_SANDBOX_BENCH_REPLACED"
             }
@@ -104,7 +99,9 @@
         {
           "tool": "file_delete",
           "arguments": {
-            "paths": ["/tmp/opensandbox-benchmark-replace-{invocation}.txt"]
+            "paths": [
+              "/workspace/.opensandbox_benchmark/bench-replace-{invocation}.txt"
+            ]
           }
         }
       ]
@@ -114,7 +111,8 @@
       "call": {
         "tool": "command_run",
         "arguments": {
-          "command": "pwd"
+          "command": "pwd",
+          "working_directory": "/workspace/django"
         }
       }
     },
@@ -124,68 +122,29 @@
         "tool": "command_run",
         "arguments": {
           "command": "ls",
-          "working_directory": "/tmp"
+          "working_directory": "/workspace/django"
         }
       }
     },
     {
       "name": "command_grep_recursive",
-      "setup": [
-        {
-          "tool": "command_run",
-          "arguments": {
-            "command": "mkdir -p /tmp/opensandbox-benchmark-grep-{invocation}"
-          }
-        },
-        {
-          "tool": "file_write",
-          "arguments": {
-            "path": "/tmp/opensandbox-benchmark-grep-{invocation}/input.txt",
-            "content": "OPEN_SANDBOX_BENCH_NEEDLE"
-          }
-        }
-      ],
       "call": {
         "tool": "command_run",
         "arguments": {
-          "command": "grep -R OPEN_SANDBOX_BENCH_NEEDLE .",
-          "working_directory": "/tmp/opensandbox-benchmark-grep-{invocation}"
+          "command": "grep -R -n \"FilteredRelation\" django",
+          "working_directory": "/workspace/django"
         }
-      },
-      "teardown": [
-        {
-          "tool": "command_run",
-          "arguments": {
-            "command": "rm -rf /tmp/opensandbox-benchmark-grep-{invocation}"
-          }
-        }
-      ]
+      }
     },
     {
       "name": "command_git_status_short",
-      "setup": [
-        {
-          "tool": "command_run",
-          "arguments": {
-            "command": "mkdir -p /tmp/opensandbox-benchmark-git-{invocation} && git -C /tmp/opensandbox-benchmark-git-{invocation} init -q && touch /tmp/opensandbox-benchmark-git-{invocation}/untracked.txt"
-          }
-        }
-      ],
       "call": {
         "tool": "command_run",
         "arguments": {
           "command": "git status --short",
-          "working_directory": "/tmp/opensandbox-benchmark-git-{invocation}"
+          "working_directory": "/workspace/django"
         }
-      },
-      "teardown": [
-        {
-          "tool": "command_run",
-          "arguments": {
-            "command": "rm -rf /tmp/opensandbox-benchmark-git-{invocation}"
-          }
-        }
-      ]
+      }
     }
   ]
 }
