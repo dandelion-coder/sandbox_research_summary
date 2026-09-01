@@ -1,32 +1,27 @@
 {
   "cases": [
     {
-      "name": "read_text",
+      "name": "file_read_small",
       "setup": [
         {
           "tool": "file_write",
           "arguments": {
-            "sandbox_id": "{sandbox_id}",
-            "path": "/tmp/opensandbox-benchmark-read-{iteration}.txt",
-            "content": "benchmark content",
-            "connect_if_missing": true
+            "path": "/tmp/opensandbox-benchmark-read-{invocation}.txt",
+            "content": "benchmark content"
           }
         }
       ],
       "call": {
         "tool": "file_read",
         "arguments": {
-          "sandbox_id": "{sandbox_id}",
-          "path": "/tmp/opensandbox-benchmark-read-{iteration}.txt",
-          "connect_if_missing": true
+          "path": "/tmp/opensandbox-benchmark-read-{invocation}.txt"
         }
       },
       "teardown": [
         {
           "tool": "file_delete",
           "arguments": {
-            "sandbox_id": "{sandbox_id}",
-            "paths": ["/tmp/opensandbox-benchmark-read-{iteration}.txt"]
+            "paths": ["/tmp/opensandbox-benchmark-read-{invocation}.txt"]
           }
         }
       ]
@@ -36,18 +31,158 @@
       "call": {
         "tool": "file_write",
         "arguments": {
-          "sandbox_id": "{sandbox_id}",
-          "path": "/tmp/opensandbox-benchmark-write-{trace_id}.txt",
-          "content": "benchmark content",
-          "connect_if_missing": true
+          "path": "/tmp/opensandbox-benchmark-write-{invocation}.txt",
+          "content": "benchmark content"
         }
       },
       "teardown": [
         {
           "tool": "file_delete",
           "arguments": {
-            "sandbox_id": "{sandbox_id}",
-            "paths": ["/tmp/opensandbox-benchmark-write-{trace_id}.txt"]
+            "paths": ["/tmp/opensandbox-benchmark-write-{invocation}.txt"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "file_search_text",
+      "setup": [
+        {
+          "tool": "command_run",
+          "arguments": {
+            "command": "mkdir -p /tmp/opensandbox-benchmark-search-{invocation}"
+          }
+        },
+        {
+          "tool": "file_write",
+          "arguments": {
+            "path": "/tmp/opensandbox-benchmark-search-{invocation}/match.txt",
+            "content": "benchmark content"
+          }
+        }
+      ],
+      "call": {
+        "tool": "file_search",
+        "arguments": {
+          "path": "/tmp/opensandbox-benchmark-search-{invocation}",
+          "pattern": "*.txt"
+        }
+      },
+      "teardown": [
+        {
+          "tool": "command_run",
+          "arguments": {
+            "command": "rm -rf /tmp/opensandbox-benchmark-search-{invocation}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "file_replace_contents",
+      "setup": [
+        {
+          "tool": "file_write",
+          "arguments": {
+            "path": "/tmp/opensandbox-benchmark-replace-{invocation}.txt",
+            "content": "OPEN_SANDBOX_BENCH_ORIGINAL"
+          }
+        }
+      ],
+      "call": {
+        "tool": "file_replace_contents",
+        "arguments": {
+          "entries": [
+            {
+              "path": "/tmp/opensandbox-benchmark-replace-{invocation}.txt",
+              "old_content": "OPEN_SANDBOX_BENCH_ORIGINAL",
+              "new_content": "OPEN_SANDBOX_BENCH_REPLACED"
+            }
+          ]
+        }
+      },
+      "teardown": [
+        {
+          "tool": "file_delete",
+          "arguments": {
+            "paths": ["/tmp/opensandbox-benchmark-replace-{invocation}.txt"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "command_pwd",
+      "call": {
+        "tool": "command_run",
+        "arguments": {
+          "command": "pwd"
+        }
+      }
+    },
+    {
+      "name": "command_ls",
+      "call": {
+        "tool": "command_run",
+        "arguments": {
+          "command": "ls",
+          "working_directory": "/tmp"
+        }
+      }
+    },
+    {
+      "name": "command_grep_recursive",
+      "setup": [
+        {
+          "tool": "command_run",
+          "arguments": {
+            "command": "mkdir -p /tmp/opensandbox-benchmark-grep-{invocation}"
+          }
+        },
+        {
+          "tool": "file_write",
+          "arguments": {
+            "path": "/tmp/opensandbox-benchmark-grep-{invocation}/input.txt",
+            "content": "OPEN_SANDBOX_BENCH_NEEDLE"
+          }
+        }
+      ],
+      "call": {
+        "tool": "command_run",
+        "arguments": {
+          "command": "grep -R OPEN_SANDBOX_BENCH_NEEDLE .",
+          "working_directory": "/tmp/opensandbox-benchmark-grep-{invocation}"
+        }
+      },
+      "teardown": [
+        {
+          "tool": "command_run",
+          "arguments": {
+            "command": "rm -rf /tmp/opensandbox-benchmark-grep-{invocation}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "command_git_status_short",
+      "setup": [
+        {
+          "tool": "command_run",
+          "arguments": {
+            "command": "mkdir -p /tmp/opensandbox-benchmark-git-{invocation} && git -C /tmp/opensandbox-benchmark-git-{invocation} init -q && touch /tmp/opensandbox-benchmark-git-{invocation}/untracked.txt"
+          }
+        }
+      ],
+      "call": {
+        "tool": "command_run",
+        "arguments": {
+          "command": "git status --short",
+          "working_directory": "/tmp/opensandbox-benchmark-git-{invocation}"
+        }
+      },
+      "teardown": [
+        {
+          "tool": "command_run",
+          "arguments": {
+            "command": "rm -rf /tmp/opensandbox-benchmark-git-{invocation}"
           }
         }
       ]

@@ -27,7 +27,7 @@ T = TypeVar("T")
 class BenchmarkEvent(BaseModel):
     """One timestamp in a benchmarked MCP tool invocation."""
 
-    trace_id: str = Field(description="Client-generated invocation identifier.")
+    trace_id: str = Field(description="MCP JSON-RPC request identifier.")
     tool: str = Field(description="MCP tool name without a registration prefix.")
     event: str = Field(description="Timeline marker: M0, B0, B1, or M4.")
     wall_time_ns: int = Field(description="Wall clock timestamp for event ordering.")
@@ -41,6 +41,11 @@ class BenchmarkRecorder:
     """In-memory recorder that keeps measurement I/O out of the hot path."""
 
     events: list[BenchmarkEvent] = field(default_factory=list)
+    enabled: bool = False
+
+    def start(self) -> None:
+        self.events.clear()
+        self.enabled = True
 
     def record(
         self,
@@ -51,7 +56,7 @@ class BenchmarkRecorder:
         status: str = "ok",
         error_type: str | None = None,
     ) -> None:
-        if trace_id is None:
+        if trace_id is None or not self.enabled:
             return
         self.events.append(
             BenchmarkEvent(
@@ -67,6 +72,7 @@ class BenchmarkRecorder:
 
     def drain(self, trace_ids: list[str] | None = None) -> list[BenchmarkEvent]:
         """Return and remove events, optionally restricted to selected traces."""
+        self.enabled = False
         if trace_ids is None:
             drained = self.events
             self.events = []

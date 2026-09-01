@@ -149,27 +149,34 @@ Here are some examples of what you can ask an LLM to do:
 - "Generate a CSV file with fake sales data and run a simple summary script."
 - "Start a tiny web server on port 8000 and return the public URL."
 - "Build a minimal REST API (hello + health) and expose it on port 8000."
+- "Create a tar.gz of /app and report the file size."
+- "Build a simple Snake game and return the web endpoint where it can be accessed."
 
 ## 7. File Tool Benchmark
 
-The package includes an opt-in, common-stage benchmark for all filesystem
-tools. Normal tool calls are not recorded. A measured call supplies a unique
-`benchmark_trace_id` and produces this server-side timeline:
+The package includes a common-stage benchmark for filesystem tools and
+`command_run`. FastMCP injects `Context` without changing tool input schemas,
+and the JSON-RPC request id is used as the trace id:
 
 ```text
-M0 -> B0 -> OpenSandbox SDK call -> B1 -> M4
+C0 -> M0 -> B0 -> OpenSandbox SDK call -> B1 -> M4 -> C1
 ```
 
-The benchmark client adds `C0` and `C1`, drains server events after the batch,
-and writes ordered raw events plus per-invocation and aggregate CSV reports.
-The OpenSandbox Python SDK and execd require no benchmark modifications.
+The client launches or connects to the MCP server, initializes MCP, connects
+the sandbox once, runs warmups, then runs measured calls with
+`connect_if_missing=false`. Server events stay in memory and are drained once
+after the complete measurement batch. The OpenSandbox Python SDK and execd
+require no benchmark modifications.
 
-Start with a copy of `benchmark-cases.example.json`, then run:
+For the current streamable HTTP experiment:
 
 ```bash
 uv run opensandbox-mcp-benchmark \
   --cases benchmark-cases.example.json \
   --sandbox-id <sandbox-id> \
+  --transport streamable-http \
+  --opensandbox-domain 127.0.0.1:8081 \
+  --opensandbox-protocol http \
   --server-command uv \
   --server-arg run \
   --server-arg opensandbox-mcp \
@@ -177,15 +184,46 @@ uv run opensandbox-mcp-benchmark \
   --output benchmark-results
 ```
 
+Before a full run, validate one request and its timeline:
+
+```bash
+uv run opensandbox-mcp-benchmark \
+  --cases benchmark-cases.example.json \
+  --case file_read_small \
+  --sandbox-id <sandbox-id> \
+  --transport streamable-http \
+  --opensandbox-domain 127.0.0.1:8081 \
+  --server-command uv \
+  --server-arg run \
+  --server-arg opensandbox-mcp \
+  --warmup 0 \
+  --iterations 1 \
+  --output benchmark-results/read-small-smoke
+```
+
+The corresponding `measurements.csv` row must have
+`timeline_order_valid=true` and `stage_sum_error_ns=0` before scaling the run.
+
 Each case can define untimed `setup` and `teardown` actions around one measured
 `call`. Strings in action arguments may use `{sandbox_id}`, `{case}`,
-`{iteration}`, and `{trace_id}`. The output directory contains:
+`{iteration}`, `{invocation}`, and (outside setup) `{trace_id}`. The output
+directory contains:
 
 - `events.jsonl`: C0/M0/B0/B1/M4/C1 events ordered by wall-clock timestamp.
 - `measurements.csv`: one row per invocation with every stage duration.
 - `summary.csv`: p50 and p95 grouped by case and tool.
 
-Client and server monotonic clocks are intentionally not subtracted from each
-other. Transport/MCP overhead is calculated as `(C1-C0) - (M4-M0)`.
-- "Create a tar.gz of /app and report the file size."
-- "Build a simple Snake game and return the web endpoint where it can be accessed."
+The formal metrics use wall-clock timestamps so cross-process stages remain
+defined and sum to E2E:
+
+```text
+Stage 1 = M0 - C0
+Stage 2 = B0 - M0
+Stage 3 = B1 - B0
+Stage 4 = C1 - B1
+E2E     = C1 - C0
+```
+
+`result_build = M4-B1` and `response_return = C1-M4` are auxiliary metrics.
+Monotonic timestamps are used only for client-local or server-local validation,
+never by subtracting a server timestamp from a client timestamp.

@@ -134,14 +134,20 @@ def register_tools(
         return sandbox
 
     @tool()
+    async def benchmark_start() -> StatusResponse:
+        """Clear buffered events and enable in-memory benchmark recording."""
+        benchmark_recorder.start()
+        return StatusResponse(status="started")
+
+    @tool()
     async def benchmark_drain_events(
         trace_ids: list[str] | None = None,
     ) -> list[BenchmarkEvent]:
         """Return and remove buffered benchmark events.
 
-        Only calls carrying ``benchmark_trace_id`` produce events. Fetch events
-        after a measurement batch so event serialization is outside the timed
-        file operation.
+        Events use the MCP JSON-RPC request id from ``Context.request_id``.
+        Fetch selected request ids after a measurement batch so event
+        serialization is outside the timed operation.
         """
         return benchmark_recorder.drain(trace_ids)
 
@@ -444,6 +450,7 @@ def register_tools(
     async def command_run(
         sandbox_id: str,
         command: str,
+        ctx: Context[ServerSession, None],
         *,
         background: bool = False,
         working_directory: str | None = None,
@@ -463,16 +470,20 @@ def register_tools(
         Example:
             result = await command_run("sbx_123", "ls -la", working_directory="/")
         """
-        sandbox = await _get_or_connect_sandbox(
-            sandbox_id,
-            connect_if_missing=connect_if_missing,
-        )
-        opts = RunCommandOpts(
-            background=background,
-            working_directory=working_directory,
-        )
-        execution = await sandbox.commands.run(command, opts=opts)
-        return execution
+        async with BenchmarkOperation(
+            benchmark_recorder, str(ctx.request_id), "command_run"
+        ) as benchmark:
+            sandbox = await _get_or_connect_sandbox(
+                sandbox_id,
+                connect_if_missing=connect_if_missing,
+            )
+            opts = RunCommandOpts(
+                background=background,
+                working_directory=working_directory,
+            )
+            return await benchmark.sdk_call(
+                lambda: sandbox.commands.run(command, opts=opts)
+            )
 
     @tool()
     async def command_interrupt(
@@ -502,11 +513,11 @@ def register_tools(
     async def file_read(
         sandbox_id: str,
         path: str,
+        ctx: Context[ServerSession, None],
         *,
         encoding: str = "utf-8",
         range_header: str | None = None,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> FileReadResponse:
         """Read a text file from the sandbox.
 
@@ -522,7 +533,7 @@ def register_tools(
 
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_read"
+            benchmark_recorder, str(ctx.request_id), "file_read"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
@@ -540,13 +551,13 @@ def register_tools(
         sandbox_id: str,
         path: str,
         content: str,
+        ctx: Context[ServerSession, None],
         *,
         encoding: str = "utf-8",
         mode: int = 755,
         owner: str | None = None,
         group: str | None = None,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Write a text file inside the sandbox.
 
@@ -564,7 +575,7 @@ def register_tools(
             {"status": "written"} when successful.
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_write"
+            benchmark_recorder, str(ctx.request_id), "file_write"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
@@ -586,9 +597,9 @@ def register_tools(
     async def file_delete(
         sandbox_id: str,
         paths: list[str],
+        ctx: Context[ServerSession, None],
         *,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Delete files inside the sandbox.
 
@@ -601,7 +612,7 @@ def register_tools(
             {"status": "deleted"} when successful.
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_delete"
+            benchmark_recorder, str(ctx.request_id), "file_delete"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
@@ -615,9 +626,9 @@ def register_tools(
         sandbox_id: str,
         path: str,
         pattern: str,
+        ctx: Context[ServerSession, None],
         *,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> list[EntryInfo]:
         """Search for files matching a pattern.
 
@@ -631,7 +642,7 @@ def register_tools(
             List of entry info objects.
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_search"
+            benchmark_recorder, str(ctx.request_id), "file_search"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
@@ -645,9 +656,9 @@ def register_tools(
     async def file_create_directories(
         sandbox_id: str,
         entries: list[DirectoryEntryInput],
+        ctx: Context[ServerSession, None],
         *,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Create directories inside the sandbox.
 
@@ -660,7 +671,7 @@ def register_tools(
             {"status": "created"} when successful.
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_create_directories"
+            benchmark_recorder, str(ctx.request_id), "file_create_directories"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
@@ -678,9 +689,9 @@ def register_tools(
     async def file_delete_directories(
         sandbox_id: str,
         paths: list[str],
+        ctx: Context[ServerSession, None],
         *,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Delete directories inside the sandbox.
 
@@ -693,7 +704,7 @@ def register_tools(
             {"status": "deleted"} when successful.
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_delete_directories"
+            benchmark_recorder, str(ctx.request_id), "file_delete_directories"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
@@ -706,9 +717,9 @@ def register_tools(
     async def file_move(
         sandbox_id: str,
         entries: list[MoveEntry],
+        ctx: Context[ServerSession, None],
         *,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> StatusResponse:
         """Move or rename files/directories inside the sandbox.
 
@@ -721,7 +732,7 @@ def register_tools(
             {"status": "moved"} when successful.
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_move"
+            benchmark_recorder, str(ctx.request_id), "file_move"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
@@ -734,9 +745,9 @@ def register_tools(
     async def file_replace_contents(
         sandbox_id: str,
         entries: list[ContentReplaceEntry],
+        ctx: Context[ServerSession, None],
         *,
         connect_if_missing: bool = False,
-        benchmark_trace_id: str | None = None,
     ) -> list[ContentReplaceResult]:
         """Replace content inside files.
 
@@ -749,7 +760,7 @@ def register_tools(
             List of replacement results with counts per file.
         """
         async with BenchmarkOperation(
-            benchmark_recorder, benchmark_trace_id, "file_replace_contents"
+            benchmark_recorder, str(ctx.request_id), "file_replace_contents"
         ) as benchmark:
             sandbox = await _get_or_connect_sandbox(
                 sandbox_id,
