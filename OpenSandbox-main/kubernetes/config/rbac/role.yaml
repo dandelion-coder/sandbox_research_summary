@@ -1,0 +1,94 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - sandbox.opensandbox.io
+  resources:
+  - batchsandboxes
+  - pools
+  - sandboxsnapshots
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sandbox.opensandbox.io
+  resources:
+  - batchsandboxes/finalizers
+  - pools/finalizers
+  - sandboxsnapshots/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - sandbox.opensandbox.io
+  resources:
+  - batchsandboxes/status
+  - pools/status
+  - sandboxsnapshots/status
+  verbs:
+  - get
+  - patch
+  - update
