@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-sandbox.ai/schemas/trajectory-benchmark/result-1.0.json",
+  "title": "Trajectory Replay Benchmark Result",
+  "type": "object",
+  "required": ["schema_version", "task_id", "backend", "status", "metrics", "steps"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "task_id": {"type": ["string", "null"]},
+    "backend": {"enum": ["direct_sdk", "stdio_mcp", "http_mcp"]},
+    "status": {"enum": ["ok", "error"]},
+    "metrics": {"type": "object"},
+    "steps": {"type": "array", "items": {"type": "object"}}
+  },
+  "additionalProperties": false
+}

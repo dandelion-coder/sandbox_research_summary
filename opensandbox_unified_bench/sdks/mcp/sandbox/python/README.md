@@ -184,6 +184,45 @@ uv run opensandbox-mcp-benchmark \
   --output benchmark-results
 ```
 
+If the MCP server is already running separately (the validated server setup
+used port `8999`), connect to it without starting another process:
+
+```bash
+uv run opensandbox-mcp-benchmark \
+  --cases benchmark-cases.example.json \
+  --case file_read_small \
+  --sandbox-id <sandbox-id> \
+  --transport streamable-http \
+  --mcp-url http://127.0.0.1:8999/mcp \
+  --no-start-server \
+  --opensandbox-domain 127.0.0.1:8081 \
+  --opensandbox-protocol http \
+  --warmup 0 \
+  --iterations 1 \
+  --output benchmark-results/read-small-smoke
+```
+
+After the smoke test passes, the corresponding baseline run is:
+
+```bash
+uv run opensandbox-mcp-benchmark \
+  --cases benchmark-cases.example.json \
+  --case file_read_small \
+  --sandbox-id <sandbox-id> \
+  --transport streamable-http \
+  --mcp-url http://127.0.0.1:8999/mcp \
+  --no-start-server \
+  --opensandbox-domain 127.0.0.1:8081 \
+  --opensandbox-protocol http \
+  --warmup 5 \
+  --iterations 100 \
+  --output benchmark-results/read-small-100
+```
+
+Port `8999` is not a benchmark requirement; it must match the separately
+started MCP server. `--no-start-server` prevents the benchmark client from
+launching a second server.
+
 Before a full run, validate one request and its timeline:
 
 ```bash
@@ -203,6 +242,21 @@ uv run opensandbox-mcp-benchmark \
 
 The corresponding `measurements.csv` row must have
 `timeline_order_valid=true` and `stage_sum_error_ns=0` before scaling the run.
+For a multi-sample run, this command prints only invalid rows and should
+therefore produce no output:
+
+```bash
+awk -F',' '
+NR==1 {
+  for(i=1;i<=NF;i++) {
+    if($i=="timeline_order_valid") valid=i
+    if($i=="stage_sum_error_ns") err=i
+  }
+  next
+}
+$valid!="True" || $err!=0 {print}
+' benchmark-results/read-small-100/measurements.csv
+```
 
 Each case can define untimed `setup` and `teardown` actions around one measured
 `call`. Strings in action arguments may use `{sandbox_id}`, `{case}`,

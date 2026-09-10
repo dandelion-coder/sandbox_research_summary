@@ -805,6 +805,7 @@ def create_server(connection_config: ConnectionConfig | None = None) -> FastMCP:
     """Create the MCP server instance for OpenSandbox."""
     mcp = FastMCP(
         "OpenSandbox Sandbox",
+        port=8999,
         instructions=(
             "Use these tools to create and manage isolated sandboxes. "
             "Always keep track of the sandbox_id returned by sandbox_create/connect. "

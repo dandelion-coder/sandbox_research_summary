@@ -1,0 +1,135 @@
+﻿{
+    "schema_version":  "1.0",
+    "task_id":  "getmoto__moto-5321",
+    "metadata":  {
+                     "source_dataset":  "SWE-Gym/OpenHands-Sampled-Trajectories",
+                     "run_id":  "gpt-4o-2024-08-06_maxiter_30_N_v2.1-no-hint-train-t04-run_1",
+                     "resolved":  false,
+                     "source_message_count":  13,
+                     "skipped_actions":  [
+
+                                         ]
+                 },
+    "trajectory":  [
+                       {
+                           "step":  0,
+                           "action":  {
+                                          "tool":  "list_directory",
+                                          "arguments":  {
+                                                            "path":  "/workspace/getmoto__moto__3.1",
+                                                            "depth":  2
+                                                        }
+                                      },
+                           "observation":  "OBSERVATION:\nHere\u0027s the files and directories up to 2 levels deep in /workspace/getmoto__moto__3.1, excluding hidden items:\n/workspace/getmoto__moto__3.1",
+                           "source":  {
+                                          "message_index":  2,
+                                          "tool_call_id":  "call_yvYHZVbXjUPsvihtKQVVOtI6",
+                                          "tool":  "str_replace_editor",
+                                          "arguments":  {
+                                                            "command":  "view",
+                                                            "path":  "/workspace/getmoto__moto__3.1"
+                                                        }
+                                      }
+                       },
+                       {
+                           "step":  1,
+                           "action":  {
+                                          "tool":  "list_directory",
+                                          "arguments":  {
+                                                            "path":  "/workspace/getmoto__moto__3.1",
+                                                            "depth":  2
+                                                        }
+                                      },
+                           "observation":  "OBSERVATION:\nHere\u0027s the files and directories up to 2 levels deep in /workspace/getmoto__moto__3.1, excluding hidden items:\n/workspace/getmoto__moto__3.1",
+                           "source":  {
+                                          "message_index":  4,
+                                          "tool_call_id":  "call_1pJhJa9YD2hFdbWDIUhuqEIV",
+                                          "tool":  "str_replace_editor",
+                                          "arguments":  {
+                                                            "command":  "view",
+                                                            "path":  "/workspace/getmoto__moto__3.1"
+                                                        }
+                                      }
+                       },
+                       {
+                           "step":  2,
+                           "action":  {
+                                          "tool":  "list_directory",
+                                          "arguments":  {
+                                                            "path":  "/workspace/getmoto__moto__3.1",
+                                                            "depth":  2
+                                                        }
+                                      },
+                           "observation":  "OBSERVATION:\nHere\u0027s the files and directories up to 2 levels deep in /workspace/getmoto__moto__3.1, excluding hidden items:\n/workspace/getmoto__moto__3.1",
+                           "source":  {
+                                          "message_index":  6,
+                                          "tool_call_id":  "call_rloEZJfziaKCxcYAW5Tud0mC",
+                                          "tool":  "str_replace_editor",
+                                          "arguments":  {
+                                                            "command":  "view",
+                                                            "path":  "/workspace/getmoto__moto__3.1"
+                                                        }
+                                      }
+                       },
+                       {
+                           "step":  3,
+                           "action":  {
+                                          "tool":  "list_directory",
+                                          "arguments":  {
+                                                            "path":  "/workspace/getmoto__moto__3.1",
+                                                            "depth":  2
+                                                        }
+                                      },
+                           "observation":  "OBSERVATION:\nHere\u0027s the files and directories up to 2 levels deep in /workspace/getmoto__moto__3.1, excluding hidden items:\n/workspace/getmoto__moto__3.1",
+                           "source":  {
+                                          "message_index":  8,
+                                          "tool_call_id":  "call_mP50aGtV3KdCx9ggln57iIvh",
+                                          "tool":  "str_replace_editor",
+                                          "arguments":  {
+                                                            "command":  "view",
+                                                            "path":  "/workspace/getmoto__moto__3.1"
+                                                        }
+                                      }
+                       },
+                       {
+                           "step":  4,
+                           "action":  {
+                                          "tool":  "list_directory",
+                                          "arguments":  {
+                                                            "path":  "/workspace/getmoto__moto__3.1",
+                                                            "depth":  2
+                                                        }
+                                      },
+                           "observation":  "OBSERVATION:\nHere\u0027s the files and directories up to 2 levels deep in /workspace/getmoto__moto__3.1, excluding hidden items:\n/workspace/getmoto__moto__3.1",
+                           "source":  {
+                                          "message_index":  10,
+                                          "tool_call_id":  "call_2RbnOQNCs5tCZIe3NLJwzDxT",
+                                          "tool":  "str_replace_editor",
+                                          "arguments":  {
+                                                            "command":  "view",
+                                                            "path":  "/workspace/getmoto__moto__3.1"
+                                                        }
+                                      }
+                       },
+                       {
+                           "step":  5,
+                           "action":  {
+                                          "tool":  "list_directory",
+                                          "arguments":  {
+                                                            "path":  "/workspace/getmoto__moto__3.1",
+                                                            "depth":  2
+                                                        }
+                                      },
+                           "observation":  "",
+                           "source":  {
+                                          "message_index":  12,
+                                          "tool_call_id":  "call_ex9taEHTSftS9e36qCdpxe3m",
+                                          "tool":  "str_replace_editor",
+                                          "arguments":  {
+                                                            "command":  "view",
+                                                            "path":  "/workspace/getmoto__moto__3.1"
+                                                        }
+                                      }
+                       }
+                   ]
+}
