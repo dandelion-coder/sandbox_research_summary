@@ -7,7 +7,6 @@ import csv
 import hashlib
 import json
 import math
-import re
 import statistics
 import time
 from collections import Counter, defaultdict
@@ -106,23 +105,26 @@ CONTROL_TOOLS = {
 
 
 def is_filesystem_operation(logical_tool: str, command: str = "") -> bool:
-    if logical_tool in {"Read", "Write", "Edit", "Grep", "Glob"}:
+    # Preserve the semantics of Claude's native file API calls. Their normalized
+    # execution mechanism (for example command_run for a ranged Read) is irrelevant.
+    if logical_tool in {"Read", "Write", "Edit"}:
         return True
-    if logical_tool == "Bash":
-        cmd = command.lower()
-        fs_commands = (
-            "ls", "cat", "head", "tail", "grep", "find", "sed", "awk",
-            "cp", "mv", "rm", "mkdir", "touch", "chmod", "wc",
-        )
-        command_pattern = "|".join(re.escape(item) for item in fs_commands)
-        # Match a command at the start of a shell segment, including after pipes,
-        # semicolons, &&/||, or newlines. This avoids classifying `echo cat` as FS.
-        if re.search(
-            rf"(?:^|[;|&\n]\s*)(?:sudo\s+)?(?:{command_pattern})(?:\s|$)",
-            cmd,
-        ):
-            return True
-    return False
+    if logical_tool != "Bash":
+        return False
+
+    # Deliberately inspect only the leading command. Looking for a filesystem word
+    # anywhere in a compound command contaminates pip/pytest/network measurements
+    # when those commands contain paths or have a later cleanup/read step.
+    parts = command.strip().split()
+    if not parts:
+        return False
+    first = parts[0].lower().replace("\\", "/").rsplit("/", 1)[-1]
+    fs_commands = {
+        "ls", "cat", "head", "tail", "less", "more", "grep", "rg", "find",
+        "sed", "awk", "cp", "mv", "rm", "mkdir", "touch", "chmod", "wc",
+        "sort",
+    }
+    return first in fs_commands
 
 
 def normalized_record(
@@ -213,11 +215,13 @@ def normalize_claude_tool_call(
             "print(''.join(chunk), end='')\n"
             "PY"
         )
-        return normalized_record(
+        record = normalized_record(
             "Read", "command_run",
             {"command": command, "working_directory": replay_root},
             fs_operation=True,
         )
+        record["source_path"] = path
+        return record
 
     if name == "Write":
         path = args.get("file_path") or args.get("path")
@@ -274,7 +278,7 @@ def normalize_claude_tool_call(
         return normalized_record(
             "Grep", "command_run",
             {"command": command, "working_directory": replay_root},
-            fs_operation=True,
+            fs_operation=False,
         )
 
     if name == "Glob":
@@ -288,7 +292,7 @@ def normalize_claude_tool_call(
         return normalized_record(
             "Glob", "command_run",
             {"command": command, "working_directory": replay_root},
-            fs_operation=True,
+            fs_operation=False,
         )
 
     reason = "control/non-filesystem tool" if name in CONTROL_TOOLS else "unsupported tool"
@@ -525,7 +529,12 @@ def describe_call(call):
         text = str(args.get("command", "")).replace("\n", " ").strip()
         return text[:140] + ("..." if len(text) > 140 else "")
     if logical_tool in {"Read", "Write"}:
-        return str(args.get("path") or args.get("file_path") or "")
+        return str(
+            args.get("path")
+            or args.get("file_path")
+            or call.get("source_path")
+            or ""
+        )
     if logical_tool == "Edit":
         entries = args.get("entries") or []
         if entries and isinstance(entries, list):
